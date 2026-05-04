@@ -1,0 +1,570 @@
+"""
+MktFotosbot - AI Fashion Photo Generator
+Flow:
+  1. Usuario manda foto + caption (Prany / Vaina / Ambas)
+  2. Bot genera previews (3 fotos + 1 video) y los manda
+  3. Usuario revisa → manda correcciones o confirma ("ok", "listo", "dale")
+  4. Bot pregunta el nombre del producto
+  5. Usuario manda el nombre → Bot crea carpeta en Drive y sube todo
+"""
+
+import os
+import json
+import time
+import threading
+import requests
+from flask import Flask, request, jsonify
+from datetime import datetime
+import fal_client
+
+app = Flask(__name__)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID      = os.environ["TELEGRAM_CHAT_ID"]
+FAL_KEY               = os.environ["FAL_KEY"]
+GOOGLE_CLIENT_ID      = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET  = os.environ["GOOGLE_CLIENT_SECRET"]
+DRIVE_REFRESH_TOKEN   = os.environ["GOOGLE_DRIVE_REFRESH_TOKEN"]
+DRIVE_FOLDER_PRANY    = os.environ["DRIVE_FOLDER_PRANY"]
+DRIVE_FOLDER_VAINA    = os.environ["DRIVE_FOLDER_VAINA"]
+MODELO_PRANY_DRIVE_ID = os.environ["MODELO_PRANY_DRIVE_ID"]
+MODELO_VAINA_DRIVE_FOLDER = os.environ.get("MODELO_VAINA_DRIVE_FOLDER", "")
+
+os.environ["FAL_KEY"] = FAL_KEY
+
+# Palabras que significan "sí, está bien"
+OK_WORDS = {"ok", "listo", "dale", "perfecto", "bueno", "si", "sí", "confirmed",
+            "confirmo", "genial", "bien", "excelente", "bárbaro", "barbaro", "yes"}
+
+# ── Estado global (bot solo responde a 1 usuario) ─────────────────────────────
+SESSION = {
+    "phase":        "idle",  # idle | generating | previewing | waiting_name | saving
+    "brands":       [],
+    "garment_bytes": None,
+    "garment_url":  None,   # URL en fal.ai
+    "category":     "tops",
+    "correction":   "",     # última corrección del usuario
+    "results": {
+        # "Prany":     {"photos": [...], "video": "...", "model_url": "..."},
+        # "Vainafash": {...},
+    },
+}
+SESSION_LOCK = threading.Lock()
+
+
+def set_phase(phase):
+    with SESSION_LOCK:
+        SESSION["phase"] = phase
+
+
+def get_phase():
+    with SESSION_LOCK:
+        return SESSION["phase"]
+
+
+# ── Telegram ───────────────────────────────────────────────────────────────────
+def tg_send(text, parse_mode="HTML"):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[TG] Error: {e}")
+
+
+def tg_send_photo(photo_url, caption=""):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": caption},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[TG] Error foto: {e}")
+
+
+def tg_send_video(video_url, caption=""):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "video": video_url,
+                "caption": caption,
+                "supports_streaming": True,
+            },
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"[TG] Error video: {e}")
+
+
+# ── Google Drive ───────────────────────────────────────────────────────────────
+_drive_cache = {"token": None, "expires": 0}
+
+
+def get_drive_token():
+    now = time.time()
+    if _drive_cache["token"] and now < _drive_cache["expires"] - 60:
+        return _drive_cache["token"]
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id":     GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": DRIVE_REFRESH_TOKEN,
+            "grant_type":    "refresh_token",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _drive_cache["token"]   = data["access_token"]
+    _drive_cache["expires"] = now + data.get("expires_in", 3600)
+    return data["access_token"]
+
+
+def drive_download(file_id, token):
+    resp = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def drive_first_image_in_folder(folder_id, token):
+    resp = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "q":        f"'{folder_id}' in parents and mimeType contains 'image/'",
+            "fields":   "files(id,name)",
+            "orderBy":  "name",
+            "pageSize": 1,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def drive_create_folder(name, parent_id, token):
+    resp = requests.post(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def drive_upload(filename, content, mime_type, folder_id, token):
+    metadata = json.dumps({"name": filename, "parents": [folder_id]})
+    resp = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+        headers={"Authorization": f"Bearer {token}"},
+        files={
+            "metadata": ("metadata", metadata.encode(), "application/json; charset=UTF-8"),
+            "file":     (filename, content, mime_type),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+# ── fal.ai ─────────────────────────────────────────────────────────────────────
+def fal_upload(image_bytes, content_type="image/jpeg"):
+    return fal_client.upload(image_bytes, content_type)
+
+
+def detect_category(text):
+    t = text.lower()
+    if any(w in t for w in ["vestido", "mono", "enterito", "jumpsuit", "mameluco", "overall"]):
+        return "one-pieces"
+    if any(w in t for w in ["pantalon", "jean", "calza", "short", "bermuda", "pollera", "falda", "leggin"]):
+        return "bottoms"
+    return "tops"
+
+
+def fashn_tryon(garment_url, model_url, category="tops"):
+    """Virtual try-on. Devuelve lista de URLs de fotos."""
+    result = fal_client.run(
+        "fal-ai/fashn/tryon/v1.5",
+        arguments={
+            "garment_image": garment_url,
+            "model_image":   model_url,
+            "category":      category,
+            "flat_lay":      True,
+            "num_samples":   3,
+        },
+    )
+    images = result.get("images", [])
+    if not images:
+        single = result.get("image", {})
+        if single.get("url"):
+            images = [single]
+    return [img["url"] for img in images if img.get("url")]
+
+
+def kling_video(image_url, prompt):
+    """Genera video con Kling v3 Pro. Devuelve URL."""
+    result = fal_client.run(
+        "fal-ai/kling-video/v3/pro/image-to-video",
+        arguments={
+            "image_url":    image_url,
+            "prompt":       prompt,
+            "duration":     "5",
+            "aspect_ratio": "9:16",
+        },
+    )
+    return result.get("video", {}).get("url", "")
+
+
+# ── Pipeline de generación ─────────────────────────────────────────────────────
+def generate_for_brand(brand, garment_bytes, garment_url, category, correction=""):
+    """
+    Genera fotos y video para una marca.
+    Si hay corrección del usuario, se incorpora al prompt del video.
+    Devuelve dict con {"photos": [...], "video": "...", "model_url": "..."}.
+    """
+    drive_token = get_drive_token()
+
+    # Modelo de referencia
+    if brand == "Prany":
+        model_bytes   = drive_download(MODELO_PRANY_DRIVE_ID, drive_token)
+        video_prompt  = (
+            "Fashion model walking elegantly, wearing the outfit, "
+            "smooth movement, soft studio lighting, clean background, fashion editorial"
+        )
+    else:  # Vainafash
+        model_file_id = drive_first_image_in_folder(MODELO_VAINA_DRIVE_FOLDER, drive_token) if MODELO_VAINA_DRIVE_FOLDER else None
+        if model_file_id:
+            model_bytes = drive_download(model_file_id, drive_token)
+        else:
+            model_bytes = garment_bytes
+        video_prompt = (
+            "POV walking video, looking down at trendy outfit, "
+            "urban street style, natural lighting, aesthetic movement"
+        )
+
+    # Si el usuario mandó una corrección, la agregamos al prompt del video
+    if correction:
+        video_prompt = f"{video_prompt}, {correction}"
+
+    model_url = fal_upload(model_bytes)
+
+    # Try-on
+    photos = fashn_tryon(garment_url, model_url, category)
+
+    # Video con la primera foto
+    video = ""
+    if photos:
+        try:
+            video = kling_video(photos[0], video_prompt)
+        except Exception as e:
+            print(f"[KLING] Error: {e}")
+
+    return {"photos": photos, "video": video, "model_url": model_url}
+
+
+def send_previews(brand, result):
+    """Manda las fotos y video de una marca por Telegram."""
+    photos = result["photos"]
+    video  = result["video"]
+
+    tg_send(f"🎨 <b>{brand}</b> — {len(photos)} fotos{' + 1 video' if video else ''}:")
+
+    for i, url in enumerate(photos):
+        tg_send_photo(url, f"{brand} - Foto {i+1}/{len(photos)}")
+        time.sleep(0.4)
+
+    if video:
+        tg_send_video(video, f"{brand} - Video")
+
+
+def run_generation(brands, garment_bytes, category, correction=""):
+    """
+    Corre el pipeline completo para todas las marcas,
+    manda previews y queda en fase 'previewing'.
+    """
+    set_phase("generating")
+
+    # Subir prenda a fal.ai (una sola vez, compartida entre marcas)
+    tg_send("⬆️ Subiendo prenda a IA...")
+    garment_url = fal_upload(garment_bytes)
+
+    with SESSION_LOCK:
+        SESSION["garment_url"] = garment_url
+        SESSION["results"] = {}
+
+    for brand in brands:
+        tg_send(f"🔄 <b>{brand}</b>: generando fotos (1-2 min)... ☕")
+        try:
+            result = generate_for_brand(brand, garment_bytes, garment_url, category, correction)
+            with SESSION_LOCK:
+                SESSION["results"][brand] = result
+            send_previews(brand, result)
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] {brand}: {traceback.format_exc()}")
+            tg_send(f"❌ <b>{brand}</b>: Error — {str(e)[:200]}")
+
+    tg_send(
+        "✅ <b>Listo para revisar.</b>\n\n"
+        "• Si está bien → <b>ok</b> / <b>listo</b> / <b>dale</b>\n"
+        "• Si querés cambios → describí qué modificar\n"
+        "  Ej: <i>\"más luminoso\"</i>, <i>\"pose diferente\"</i>, <i>\"solo Prany\"</i>"
+    )
+    set_phase("previewing")
+
+
+def save_to_drive(product_name):
+    """Crea carpetas en Drive y sube todo. Solo se llama tras confirmación."""
+    set_phase("saving")
+
+    date_str  = datetime.now().strftime("%Y%m%d")
+    safe_name = product_name[:40].replace(" ", "_").replace("/", "-")
+    folder_name = f"{date_str}_{safe_name}"
+
+    drive_token = get_drive_token()
+    tg_send(f"💾 Guardando <b>{product_name}</b> en Drive...")
+
+    with SESSION_LOCK:
+        results = dict(SESSION["results"])
+        brands  = list(SESSION["brands"])
+
+    for brand in brands:
+        result = results.get(brand)
+        if not result:
+            continue
+
+        parent_folder = DRIVE_FOLDER_PRANY if brand == "Prany" else DRIVE_FOLDER_VAINA
+
+        try:
+            subfolder_id = drive_create_folder(folder_name, parent_folder, drive_token)
+
+            for i, img_url in enumerate(result["photos"]):
+                img_bytes = requests.get(img_url, timeout=30).content
+                drive_upload(f"foto_{i+1}.jpg", img_bytes, "image/jpeg", subfolder_id, drive_token)
+
+            if result["video"]:
+                vid_bytes = requests.get(result["video"], timeout=60).content
+                drive_upload("video_1.mp4", vid_bytes, "video/mp4", subfolder_id, drive_token)
+
+            drive_link = f"https://drive.google.com/drive/folders/{subfolder_id}"
+            tg_send(
+                f"✅ <b>{brand}</b> guardado\n"
+                f"📁 <a href='{drive_link}'>{folder_name}</a>"
+            )
+
+        except Exception as e:
+            print(f"[DRIVE] Error {brand}: {e}")
+            tg_send(f"❌ Error guardando <b>{brand}</b>: {str(e)[:150]}")
+
+    tg_send("🎉 ¡Todo guardado! Mandame otra foto cuando quieras.")
+    with SESSION_LOCK:
+        SESSION["phase"]        = "idle"
+        SESSION["brands"]       = []
+        SESSION["garment_bytes"] = None
+        SESSION["garment_url"]  = None
+        SESSION["results"]      = {}
+        SESSION["correction"]   = ""
+
+
+# ── Handlers de mensajes ───────────────────────────────────────────────────────
+def handle_photo(message):
+    """Usuario mandó una foto. Parsea caption y arranca generación."""
+    phase = get_phase()
+
+    if phase == "generating" or phase == "saving":
+        tg_send("⏳ Todavía estoy generando, esperá un momento...")
+        return
+
+    caption = (message.get("caption") or "").strip()
+    cap_low = caption.lower()
+
+    # Detectar marcas
+    if cap_low.startswith("prany"):
+        brands  = ["Prany"]
+    elif cap_low.startswith("vaina"):
+        brands  = ["Vainafash"]
+    elif any(w in cap_low for w in ["ambas", "las dos", "ambos", "ambas"]):
+        brands  = ["Prany", "Vainafash"]
+    else:
+        # Por default preguntamos (o usamos ambas si no hay caption)
+        if not caption:
+            tg_send(
+                "❓ Escribí la marca en el caption:\n"
+                "• <b>Prany</b>\n"
+                "• <b>Vaina</b>\n"
+                "• <b>Ambas</b>"
+            )
+            return
+        # Si hay caption pero sin marca, asumir ambas
+        brands = ["Prany", "Vainafash"]
+
+    # Hint de categoría desde el caption (si lo dieron)
+    category = detect_category(caption)
+
+    # Descargar foto
+    photo_list = message.get("photo", [])
+    document   = message.get("document", {})
+
+    if photo_list:
+        file_id = max(photo_list, key=lambda p: p.get("file_size", 0))["file_id"]
+    elif document and document.get("mime_type", "").startswith("image"):
+        file_id = document["file_id"]
+    else:
+        tg_send("❌ No encontré imagen en el mensaje.")
+        return
+
+    try:
+        fi = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10,
+        ).json()
+        photo_bytes = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fi['result']['file_path']}",
+            timeout=30,
+        ).content
+    except Exception as e:
+        tg_send(f"❌ Error descargando foto: {e}")
+        return
+
+    # Guardar en sesión
+    with SESSION_LOCK:
+        SESSION["brands"]        = brands
+        SESSION["garment_bytes"] = photo_bytes
+        SESSION["category"]      = category
+        SESSION["correction"]    = ""
+
+    tg_send(
+        f"📸 Foto recibida ({len(photo_bytes) // 1024} KB) | "
+        f"Marca(s): <b>{', '.join(brands)}</b>\n"
+        f"⏳ Generando previews..."
+    )
+
+    threading.Thread(
+        target=run_generation,
+        args=(brands, photo_bytes, category, ""),
+        daemon=True,
+    ).start()
+
+
+def handle_text(message):
+    """Usuario mandó texto. Depende de la fase actual."""
+    text  = message.get("text", "").strip()
+    words = set(text.lower().split())
+    phase = get_phase()
+
+    # ── /start o saludo ───────────────────────────────────────────────────────
+    if text.startswith("/start") or text.lower() in ("hola", "start"):
+        tg_send(
+            "👗 <b>MktFotos Bot</b>\n\n"
+            "Mandame una foto de la prenda con el caption:\n\n"
+            "• <b>Prany</b>\n"
+            "• <b>Vaina</b>\n"
+            "• <b>Ambas</b>\n\n"
+            "Generaré las fotos, me decís si está bien o querés cambios, "
+            "y cuando confirmás te pido el nombre para guardar en Drive 📁"
+        )
+        return
+
+    # ── Cancelar en cualquier momento ─────────────────────────────────────────
+    if text.lower() in ("cancelar", "cancel", "/cancel", "borrar"):
+        with SESSION_LOCK:
+            SESSION["phase"]        = "idle"
+            SESSION["brands"]       = []
+            SESSION["garment_bytes"] = None
+            SESSION["results"]      = {}
+        tg_send("🗑️ Sesión cancelada. Mandame una nueva foto cuando quieras.")
+        return
+
+    # ── Fase: previewing — espera OK o corrección ──────────────────────────────
+    if phase == "previewing":
+        if words & OK_WORDS:
+            # Usuario confirmó → pedir nombre
+            set_phase("waiting_name")
+            tg_send("✏️ ¿Cómo se llama el producto? (ese nombre se va a usar para la carpeta en Drive)")
+            return
+        else:
+            # Corrección: regenerar con el texto como hint
+            with SESSION_LOCK:
+                brands        = list(SESSION["brands"])
+                garment_bytes = SESSION["garment_bytes"]
+                category      = SESSION["category"]
+                SESSION["correction"] = text
+
+            tg_send(f"🔄 Aplicando corrección: <i>\"{text}\"</i>")
+            threading.Thread(
+                target=run_generation,
+                args=(brands, garment_bytes, category, text),
+                daemon=True,
+            ).start()
+        return
+
+    # ── Fase: waiting_name — espera el nombre del producto ────────────────────
+    if phase == "waiting_name":
+        product_name = text
+        threading.Thread(
+            target=save_to_drive,
+            args=(product_name,),
+            daemon=True,
+        ).start()
+        return
+
+    # ── Fase idle u otras ─────────────────────────────────────────────────────
+    if phase in ("generating", "saving"):
+        tg_send("⏳ Estoy trabajando, esperá un momento...")
+    else:
+        tg_send(
+            "📸 Mandame una foto de la prenda con el caption de la marca:\n"
+            "<b>Prany</b> / <b>Vaina</b> / <b>Ambas</b>"
+        )
+
+
+# ── Webhook ────────────────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update  = request.get_json(force=True, silent=True) or {}
+    message = update.get("message", {})
+
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    if chat_id != TELEGRAM_CHAT_ID:
+        return jsonify({"ok": True})
+
+    if "photo" in message or (
+        "document" in message and
+        message["document"].get("mime_type", "").startswith("image")
+    ):
+        threading.Thread(target=handle_photo, args=(message,), daemon=True).start()
+    elif "text" in message:
+        handle_text(message)
+
+    return jsonify({"ok": True})
+
+
+@app.route("/health")
+def health():
+    with SESSION_LOCK:
+        phase = SESSION["phase"]
+    return jsonify({"status": "ok", "phase": phase})
+
+
+@app.route("/")
+def index():
+    return jsonify({"bot": "MktFotosbot", "status": "running"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"[BOT] Puerto {port}")
+    app.run(host="0.0.0.0", port=port)
