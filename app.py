@@ -11,9 +11,10 @@ Flow:
 import os
 import json
 import time
+import base64
 import threading
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from datetime import datetime
 import fal_client
 
@@ -32,6 +33,20 @@ MODELO_PRANY_DRIVE_ID = os.environ["MODELO_PRANY_DRIVE_ID"]
 MODELO_VAINA_DRIVE_FOLDER = os.environ.get("MODELO_VAINA_DRIVE_FOLDER", "")
 
 os.environ["FAL_KEY"] = FAL_KEY
+
+# ── TikTok OAuth config ────────────────────────────────────────────────────────
+TIKTOK_APP_ID      = os.environ.get("TIKTOK_APP_ID", "")
+TIKTOK_APP_SECRET  = os.environ.get("TIKTOK_APP_SECRET", "")
+GITHUB_PAT         = os.environ.get("GITHUB_PAT", "")
+GITHUB_REPOSITORY  = os.environ.get("GITHUB_REPOSITORY", "Johnnybencu/marketing-hub")
+BOT_PUBLIC_URL     = os.environ.get("BOT_PUBLIC_URL", "https://web-production-71a27.up.railway.app")
+TIKTOK_REDIRECT    = f"{BOT_PUBLIC_URL}/tiktok-callback"
+
+TIKTOK_SECRET_MAP = {
+    "prany":     {"token": "TIKTOK_TOKEN_PRANY",  "refresh": "TIKTOK_REFRESH_TOKEN_PRANY"},
+    "vainafash": {"token": "TIKTOK_TOKEN_VAINA",  "refresh": "TIKTOK_REFRESH_TOKEN_VAINA"},
+    "vaina":     {"token": "TIKTOK_TOKEN_VAINA",  "refresh": "TIKTOK_REFRESH_TOKEN_VAINA"},
+}
 
 # Palabras que significan "sí, está bien"
 OK_WORDS = {"ok", "listo", "dale", "perfecto", "bueno", "si", "sí", "confirmed",
@@ -562,6 +577,146 @@ def health():
 @app.route("/")
 def index():
     return jsonify({"bot": "MktFotosbot", "status": "running"})
+
+
+# ── TikTok OAuth ───────────────────────────────────────────────────────────────
+
+def _gh_public_key():
+    """Obtiene la public key del repo para encriptar GitHub Secrets."""
+    if not GITHUB_PAT:
+        return None, None
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/public-key",
+            headers={"Authorization": f"Bearer {GITHUB_PAT}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            return d["key"], d["key_id"]
+    except Exception as e:
+        print(f"[GITHUB] public_key error: {e}")
+    return None, None
+
+
+def _gh_update_secret(name, value, pub_key, key_id):
+    """Encripta y sube un secret a GitHub Actions via API."""
+    try:
+        from nacl import public as nacl_public
+        pk = nacl_public.PublicKey(base64.b64decode(pub_key))
+        encrypted = base64.b64encode(
+            nacl_public.SealedBox(pk).encrypt(value.encode())
+        ).decode()
+    except ImportError:
+        print("[GITHUB] PyNaCl no instalado")
+        return False
+    try:
+        r = requests.put(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/secrets/{name}",
+            headers={"Authorization": f"Bearer {GITHUB_PAT}",
+                     "Accept": "application/vnd.github+json"},
+            json={"encrypted_value": encrypted, "key_id": key_id},
+            timeout=10,
+        )
+        return r.status_code in (201, 204)
+    except Exception as e:
+        print(f"[GITHUB] update_secret error: {e}")
+        return False
+
+
+@app.route("/tiktok-auth/<marca>")
+def tiktok_auth(marca):
+    """
+    Redirige al flujo OAuth de TikTok.
+    Uso: abrir en el navegador → autorizar → callback automático.
+    Ejemplo: https://web-production-71a27.up.railway.app/tiktok-auth/prany
+    """
+    marca_lower = marca.lower()
+    if marca_lower not in TIKTOK_SECRET_MAP:
+        return f"Marca '{marca}' no reconocida. Usar: prany, vainafash", 400
+    if not TIKTOK_APP_ID:
+        return "TIKTOK_APP_ID no configurado en Railway", 500
+
+    auth_url = (
+        f"https://business-api.tiktok.com/portal/auth"
+        f"?app_id={TIKTOK_APP_ID}"
+        f"&state={marca_lower}"
+        f"&redirect_uri={TIKTOK_REDIRECT}"
+    )
+    print(f"[TIKTOK AUTH] Redirigiendo {marca_lower} → {auth_url}")
+    return redirect(auth_url)
+
+
+@app.route("/tiktok-callback")
+def tiktok_callback():
+    """
+    Recibe el auth_code de TikTok después del OAuth.
+    Intercambia por access_token + refresh_token y los guarda en GitHub Secrets.
+    """
+    auth_code = request.args.get("auth_code", "").strip()
+    state     = request.args.get("state", "").lower().strip()
+
+    print(f"[TIKTOK CALLBACK] state={state} auth_code={'OK' if auth_code else 'MISSING'}")
+
+    if not auth_code:
+        return "<h2>❌ Error</h2><p>No se recibió auth_code de TikTok.</p>", 400
+    if state not in TIKTOK_SECRET_MAP:
+        return f"<h2>❌ Error</h2><p>Estado '{state}' no reconocido.</p>", 400
+
+    # Intercambiar código por tokens
+    try:
+        r = requests.post(
+            "https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/",
+            json={"app_id": TIKTOK_APP_ID, "secret": TIKTOK_APP_SECRET, "auth_code": auth_code},
+            timeout=15,
+        )
+        data = r.json()
+    except Exception as e:
+        tg_send(f"❌ <b>TikTok OAuth {state}</b>: error de red — {e}")
+        return f"<h2>❌ Error de red</h2><p>{e}</p>", 500
+
+    if data.get("code") != 0:
+        msg = f"{data.get('message', 'Error desconocido')} (code={data.get('code')})"
+        tg_send(f"❌ <b>TikTok OAuth {state}</b>: {msg}")
+        return f"<h2>❌ TikTok rechazó el código</h2><p>{msg}</p>", 400
+
+    token_data    = data.get("data", {})
+    access_token  = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+    expires_h     = token_data.get("access_token_expires_in", 86400) // 3600
+    refresh_days  = token_data.get("refresh_token_expires_in", 0) // 86400
+
+    # Guardar en GitHub Secrets
+    secrets = TIKTOK_SECRET_MAP[state]
+    pub_key, key_id = _gh_public_key()
+    resultados = []
+
+    if pub_key:
+        ok1 = _gh_update_secret(secrets["token"],   access_token,  pub_key, key_id)
+        ok2 = _gh_update_secret(secrets["refresh"],  refresh_token, pub_key, key_id)
+        resultados.append(f"{'✅' if ok1 else '❌'} {secrets['token']}")
+        resultados.append(f"{'✅' if ok2 else '❌'} {secrets['refresh']}")
+    else:
+        resultados.append("❌ Sin GITHUB_PAT — secrets no actualizados")
+
+    marca_display = state.capitalize()
+    resumen = "\n".join(resultados)
+    tg_send(
+        f"🎉 <b>TikTok {marca_display} — OAuth completado</b>\n\n"
+        f"{resumen}\n\n"
+        f"⏱ Access token: válido {expires_h}h\n"
+        f"🔄 Refresh token: válido {refresh_days}d"
+    )
+
+    return f"""
+    <html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;text-align:center">
+    <h2>✅ TikTok {marca_display} autorizado</h2>
+    <p>Tokens guardados en GitHub Secrets automáticamente.</p>
+    <pre style="text-align:left;background:#f0f0f0;padding:16px;border-radius:8px">{resumen}</pre>
+    <p>Podés cerrar esta pestaña.</p>
+    </body></html>
+    """, 200
 
 
 if __name__ == "__main__":
