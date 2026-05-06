@@ -16,6 +16,7 @@ import threading
 import requests
 from flask import Flask, request, jsonify, redirect
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fal_client
 
 app = Flask(__name__)
@@ -210,15 +211,33 @@ def detect_category(text):
     return "tops"
 
 
+def kling_tryon_single(garment_url, model_url, category="tops"):
+    """Una sola foto con Kling Kolors v1.5 — mejor para texturas (peluche, cuero, lana)."""
+    cat_desc = {
+        "tops":      "upper body garment",
+        "bottoms":   "lower body garment, pants or skirt",
+        "one-pieces": "full body outfit, dress or jumpsuit",
+    }
+    result = fal_client.run(
+        "fal-ai/kling/v1-5/kolors-virtual-try-on",
+        arguments={
+            "human_image":        model_url,
+            "garment_image":      garment_url,
+            "garment_description": cat_desc.get(category, "upper body garment"),
+        },
+    )
+    return (result.get("image") or {}).get("url", "")
+
+
 def fashn_tryon(garment_url, model_url, category="tops", flat_lay=False):
-    """Virtual try-on. Devuelve lista de URLs de fotos."""
+    """Virtual try-on con FASHN v1.6 — fallback. Devuelve lista de URLs."""
     result = fal_client.run(
         "fal-ai/fashn/tryon/v1.6",
         arguments={
             "garment_image":      garment_url,
             "model_image":        model_url,
             "category":           category,
-            "flat_lay":           flat_lay,   # True solo si la prenda viene en fondo blanco limpio
+            "flat_lay":           flat_lay,
             "num_samples":        3,
             "long_top":           False,
             "restore_background": True,
@@ -231,6 +250,41 @@ def fashn_tryon(garment_url, model_url, category="tops", flat_lay=False):
         if single.get("url"):
             images = [single]
     return [img["url"] for img in images if img.get("url")]
+
+
+def tryon_multi(garment_url, model_url, category="tops", flat_lay=False, n=3):
+    """
+    Genera n fotos usando Kling v1.5 como principal (mejor para texturas como peluche/cuero).
+    Si Kling falla, cae automáticamente a FASHN v1.6.
+    """
+    photos = []
+
+    # ── Kling primero (mejor calidad para texturas) ────────────────────────────
+    print("  [Kling] Intentando try-on...")
+    try:
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = [ex.submit(kling_tryon_single, garment_url, model_url, category)
+                       for _ in range(n)]
+            for f in as_completed(futures):
+                url = f.result()
+                if url:
+                    photos.append(url)
+        if photos:
+            print(f"  [Kling] ✓ {len(photos)} fotos generadas")
+            return photos
+        print("  [Kling] Sin resultados — fallback a FASHN")
+    except Exception as e:
+        print(f"  [Kling] Error: {e} — fallback a FASHN")
+
+    # ── FASHN como fallback ────────────────────────────────────────────────────
+    print("  [FASHN] Intentando try-on (fallback)...")
+    try:
+        photos = fashn_tryon(garment_url, model_url, category, flat_lay=flat_lay)
+        print(f"  [FASHN] ✓ {len(photos)} fotos generadas")
+    except Exception as e:
+        print(f"  [FASHN] Error: {e}")
+
+    return photos
 
 
 def kling_video(image_url, prompt):
@@ -280,8 +334,8 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
 
     model_url = fal_upload(model_bytes)
 
-    # Try-on (flat_lay=False por default; solo True si fondo blanco limpio)
-    photos = fashn_tryon(garment_url, model_url, category, flat_lay=flat_lay)
+    # Try-on: Kling v1.5 como principal, FASHN como fallback
+    photos = tryon_multi(garment_url, model_url, category, flat_lay=flat_lay, n=3)
 
     # Video con la primera foto
     video = ""
