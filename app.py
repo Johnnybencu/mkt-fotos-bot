@@ -59,6 +59,7 @@ SESSION = {
     "garment_bytes": None,
     "garment_url":  None,   # URL en fal.ai
     "category":     "tops",
+    "flat_lay":     False,  # True solo si foto con fondo blanco limpio
     "correction":   "",     # última corrección del usuario
     "results": {
         # "Prany":     {"photos": [...], "video": "...", "model_url": "..."},
@@ -209,19 +210,19 @@ def detect_category(text):
     return "tops"
 
 
-def fashn_tryon(garment_url, model_url, category="tops"):
+def fashn_tryon(garment_url, model_url, category="tops", flat_lay=False):
     """Virtual try-on. Devuelve lista de URLs de fotos."""
     result = fal_client.run(
         "fal-ai/fashn/tryon/v1.6",
         arguments={
-            "garment_image":    garment_url,
-            "model_image":      model_url,
-            "category":         category,
-            "flat_lay":         True,
-            "num_samples":      3,
-            "long_top":         False,
+            "garment_image":      garment_url,
+            "model_image":        model_url,
+            "category":           category,
+            "flat_lay":           flat_lay,   # True solo si la prenda viene en fondo blanco limpio
+            "num_samples":        3,
+            "long_top":           False,
             "restore_background": True,
-            "restore_clothes":  True,
+            "restore_clothes":    True,
         },
     )
     images = result.get("images", [])
@@ -247,7 +248,7 @@ def kling_video(image_url, prompt):
 
 
 # ── Pipeline de generación ─────────────────────────────────────────────────────
-def generate_for_brand(brand, garment_bytes, garment_url, category, correction=""):
+def generate_for_brand(brand, garment_bytes, garment_url, category, correction="", flat_lay=False):
     """
     Genera fotos y video para una marca.
     Si hay corrección del usuario, se incorpora al prompt del video.
@@ -279,8 +280,8 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
 
     model_url = fal_upload(model_bytes)
 
-    # Try-on
-    photos = fashn_tryon(garment_url, model_url, category)
+    # Try-on (flat_lay=False por default; solo True si fondo blanco limpio)
+    photos = fashn_tryon(garment_url, model_url, category, flat_lay=flat_lay)
 
     # Video con la primera foto
     video = ""
@@ -308,7 +309,7 @@ def send_previews(brand, result):
         tg_send_video(video, f"{brand} - Video")
 
 
-def run_generation(brands, garment_bytes, category, correction=""):
+def run_generation(brands, garment_bytes, category, correction="", flat_lay=False):
     """
     Corre el pipeline completo para todas las marcas,
     manda previews y queda en fase 'previewing'.
@@ -326,7 +327,7 @@ def run_generation(brands, garment_bytes, category, correction=""):
     for brand in brands:
         tg_send(f"🔄 <b>{brand}</b>: generando fotos (1-2 min)... ☕")
         try:
-            result = generate_for_brand(brand, garment_bytes, garment_url, category, correction)
+            result = generate_for_brand(brand, garment_bytes, garment_url, category, correction, flat_lay)
             with SESSION_LOCK:
                 SESSION["results"][brand] = result
             send_previews(brand, result)
@@ -393,6 +394,7 @@ def save_to_drive(product_name):
         SESSION["brands"]       = []
         SESSION["garment_bytes"] = None
         SESSION["garment_url"]  = None
+        SESSION["flat_lay"]     = False
         SESSION["results"]      = {}
         SESSION["correction"]   = ""
 
@@ -432,6 +434,9 @@ def handle_photo(message):
     # Hint de categoría desde el caption (si lo dieron)
     category = detect_category(caption)
 
+    # flat_lay solo si el usuario indica explícitamente que la foto es producto en fondo blanco
+    flat_lay = any(w in cap_low for w in ["fondo blanco", "flat lay", "flatlay", "producto", "hanger", "percha"])
+
     # Descargar foto
     photo_list = message.get("photo", [])
     document   = message.get("document", {})
@@ -462,17 +467,19 @@ def handle_photo(message):
         SESSION["brands"]        = brands
         SESSION["garment_bytes"] = photo_bytes
         SESSION["category"]      = category
+        SESSION["flat_lay"]      = flat_lay
         SESSION["correction"]    = ""
 
+    modo = "fondo blanco ✅" if flat_lay else "foto de campo"
     tg_send(
         f"📸 Foto recibida ({len(photo_bytes) // 1024} KB) | "
-        f"Marca(s): <b>{', '.join(brands)}</b>\n"
+        f"Marca(s): <b>{', '.join(brands)}</b> | Modo: {modo}\n"
         f"⏳ Generando previews..."
     )
 
     threading.Thread(
         target=run_generation,
-        args=(brands, photo_bytes, category, ""),
+        args=(brands, photo_bytes, category, "", flat_lay),
         daemon=True,
     ).start()
 
@@ -519,12 +526,13 @@ def handle_text(message):
                 brands        = list(SESSION["brands"])
                 garment_bytes = SESSION["garment_bytes"]
                 category      = SESSION["category"]
+                flat_lay      = SESSION["flat_lay"]
                 SESSION["correction"] = text
 
             tg_send(f"🔄 Aplicando corrección: <i>\"{text}\"</i>")
             threading.Thread(
                 target=run_generation,
-                args=(brands, garment_bytes, category, text),
+                args=(brands, garment_bytes, category, text, flat_lay),
                 daemon=True,
             ).start()
         return
