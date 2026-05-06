@@ -61,6 +61,7 @@ SESSION = {
     "garment_url":  None,   # URL en fal.ai
     "category":     "tops",
     "flat_lay":     False,  # True solo si foto con fondo blanco limpio
+    "caption":      "",     # caption original del usuario (para feedback loop)
     "correction":   "",     # última corrección del usuario
     "results": {
         # "Prany":     {"photos": [...], "video": "...", "model_url": "..."},
@@ -209,6 +210,94 @@ def detect_category(text):
     if any(w in t for w in ["pantalon", "jean", "calza", "short", "bermuda", "pollera", "falda", "leggin"]):
         return "bottoms"
     return "tops"
+
+
+def _extract_style_keywords(caption, correction, flat_lay, category):
+    """Extrae keywords de estilo para el feedback loop."""
+    keywords = []
+    text = ((caption or "") + " " + (correction or "")).lower()
+
+    if flat_lay:
+        keywords.append("producto_fondo_blanco")
+    else:
+        keywords.append("con_modelo")
+
+    style_map = {
+        "exterior":  ["exterior", "calle", "outdoor", "urbano", "urban", "afuera"],
+        "estudio":   ["estudio", "studio", "fondo blanco", "clean background"],
+        "editorial": ["editorial", "fashion", "elegante", "lookbook"],
+        "casual":    ["casual", "relajado", "everyday", "dia a dia"],
+        "dinamico":  ["movimiento", "walking", "caminando", "dinamico"],
+        "natural":   ["natural", "aire libre", "parque", "luz natural"],
+        "oscuro":    ["oscuro", "dark", "noche", "night"],
+        "colorido":  ["colorido", "vibrante", "colores"],
+    }
+    for style, words in style_map.items():
+        if any(w in text for w in words):
+            keywords.append(style)
+
+    keywords.append(f"cat_{category}")
+    return keywords or ["estudio"]
+
+
+def log_photo_session(brand, product_name, category, flat_lay, caption, correction, drive_url):
+    """
+    Loguea la sesión en data/photo_log.json del repo marketing-hub via GitHub API.
+    Se usa para el feedback loop: cruzar estética de fotos con conversiones GA4.
+    """
+    if not GITHUB_PAT:
+        print("[PhotoLog] Sin GITHUB_PAT — skip")
+        return
+
+    entry = {
+        "fecha":    datetime.now().strftime("%Y-%m-%d"),
+        "hora":     datetime.now().strftime("%H:%M"),
+        "marca":    brand,
+        "producto": product_name[:60],
+        "categoria": category,
+        "flat_lay": flat_lay,
+        "keywords": _extract_style_keywords(caption, correction, flat_lay, category),
+        "modelo_ia": "kling_v15",
+        "drive_url": drive_url,
+    }
+
+    repo    = GITHUB_REPOSITORY
+    api_url = f"https://api.github.com/repos/{repo}/contents/data/photo_log.json"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    try:
+        # Leer archivo actual
+        r = requests.get(api_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data    = r.json()
+            content = json.loads(base64.b64decode(data["content"]).decode())
+            sha     = data["sha"]
+        else:
+            content = []
+            sha     = None
+
+        content.append(entry)
+
+        # Mantener solo los últimos 90 días para no inflar el archivo
+        cutoff  = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        content = [e for e in content if e.get("fecha", "") >= cutoff]
+
+        body = {
+            "message": f"📸 Photo log {brand} — {product_name[:30]}",
+            "content": base64.b64encode(
+                json.dumps(content, indent=2, ensure_ascii=False).encode()
+            ).decode(),
+        }
+        if sha:
+            body["sha"] = sha
+
+        requests.put(api_url, headers=headers, json=body, timeout=15)
+        print(f"[PhotoLog] ✓ {brand} — {product_name}")
+    except Exception as e:
+        print(f"[PhotoLog] Error: {e}")
 
 
 def kling_tryon_single(garment_url, model_url, category="tops"):
@@ -438,6 +527,14 @@ def save_to_drive(product_name):
                 f"📁 <a href='{drive_link}'>{folder_name}</a>"
             )
 
+            # Feedback loop: loguear sesión para cruzar con GA4 después
+            with SESSION_LOCK:
+                _cap  = SESSION.get("caption", "")
+                _corr = SESSION.get("correction", "")
+                _fl   = SESSION.get("flat_lay", False)
+                _cat  = SESSION.get("category", "tops")
+            log_photo_session(brand, product_name, _cat, _fl, _cap, _corr, drive_link)
+
         except Exception as e:
             print(f"[DRIVE] Error {brand}: {e}")
             tg_send(f"❌ Error guardando <b>{brand}</b>: {str(e)[:150]}")
@@ -522,6 +619,7 @@ def handle_photo(message):
         SESSION["garment_bytes"] = photo_bytes
         SESSION["category"]      = category
         SESSION["flat_lay"]      = flat_lay
+        SESSION["caption"]       = caption
         SESSION["correction"]    = ""
 
     modo = "fondo blanco ✅" if flat_lay else "foto de campo"
