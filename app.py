@@ -212,13 +212,16 @@ def detect_category(text):
 def fashn_tryon(garment_url, model_url, category="tops"):
     """Virtual try-on. Devuelve lista de URLs de fotos."""
     result = fal_client.run(
-        "fal-ai/fashn/tryon/v1.5",
+        "fal-ai/fashn/tryon/v1.6",
         arguments={
-            "garment_image": garment_url,
-            "model_image":   model_url,
-            "category":      category,
-            "flat_lay":      True,
-            "num_samples":   3,
+            "garment_image":    garment_url,
+            "model_image":      model_url,
+            "category":         category,
+            "flat_lay":         True,
+            "num_samples":      3,
+            "long_top":         False,
+            "restore_background": True,
+            "restore_clothes":  True,
         },
     )
     images = result.get("images", [])
