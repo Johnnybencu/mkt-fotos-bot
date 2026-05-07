@@ -435,6 +435,57 @@ def enhance_garment_with_fallback(garment_bytes):
     return None, None
 
 
+def gemini_tryon(garment_bytes, n=3):
+    """
+    Gemini 2.0 Flash: genera n fotos de un modelo vistiendo la prenda.
+    Corre n llamadas en paralelo. Retorna lista de bytes (imágenes).
+    """
+    if not GEMINI_API_KEY:
+        return []
+    try:
+        from google import genai as google_genai
+        from google.genai import types as google_types
+
+        client = google_genai.Client(api_key=GEMINI_API_KEY)
+
+        def _one_call(_):
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash-preview-image-generation",
+                contents=[
+                    google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
+                    (
+                        "This is a clothing/garment item. Generate a professional fashion e-commerce photo "
+                        "of a model wearing this EXACT garment. Requirements: "
+                        "natural standing pose, clean white or light studio background, "
+                        "professional studio lighting, exact same garment colors and design, "
+                        "full body or 3/4 shot, high quality photorealistic result. "
+                        "Do NOT add any other clothing or accessories not in the original."
+                    ),
+                ],
+                config=google_types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"]
+                ),
+            )
+            for part in resp.candidates[0].content.parts:
+                if hasattr(part, "inline_data") and part.inline_data is not None:
+                    return part.inline_data.data
+            return None
+
+        results = []
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = [ex.submit(_one_call, i) for i in range(n)]
+            for f in as_completed(futures):
+                img = f.result()
+                if img:
+                    results.append(img)
+
+        print(f"  [Gemini] ✓ {len(results)}/{n} fotos generadas")
+        return results
+    except Exception as e:
+        print(f"  [Gemini tryon] Error: {e}")
+        return []
+
+
 def _extract_style_keywords(caption, correction, flat_lay, category):
     """Extrae keywords de estilo para el feedback loop."""
     keywords = []
@@ -644,49 +695,73 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
     if correction:
         video_prompt = f"{video_prompt}, {correction}"
 
-    model_url = fal_upload(model_bytes)
+    photos        = []
+    modelo_ia_usado = "kling_v15"
 
-    # ── Paso 1: Mejorar prenda con cascade (Gemini → Pixelcut → ...) ────────
-    tg_send(f"🔮 <b>{brand}</b>: mejorando imagen con IA...")
-    enhanced_bytes, enhance_service = enhance_garment_with_fallback(garment_bytes)
+    # ── Paso 1: Gemini genera fotos con modelo (principal) ────────────────
+    tg_send(f"🔮 <b>{brand}</b>: Gemini generando 3 fotos con modelo...")
+    gemini_bytes_list = gemini_tryon(garment_bytes, n=3)
 
-    if enhanced_bytes:
-        tg_send(f"✅ <b>{brand}</b>: prenda mejorada por <b>{enhance_service}</b>")
-        tryon_garment_url = fal_upload(enhanced_bytes)
-        modelo_ia_usado   = f"{enhance_service.lower()}_kling"
-    else:
-        tryon_garment_url = garment_url
-        modelo_ia_usado   = "kling_v15"
-
-    # ── Paso 2: Try-on con prenda (mejorada o original) ───────────────────
-    photos = tryon_multi(tryon_garment_url, model_url, category, flat_lay=flat_lay, n=3)
-
-    # ── Paso 3: Evaluar resultados del try-on con Claude ─────────────────
-    if photos and ANTHROPIC_API_KEY:
-        tg_send(f"🔍 <b>{brand}</b>: evaluando {len(photos)} fotos con Claude...")
-        good_photos, bad_photos = [], []
-        for url in photos:
-            ev = claude_evaluate_photo(image_url=url)
+    if gemini_bytes_list:
+        tg_send(f"🔍 <b>{brand}</b>: Claude evaluando calidad Gemini...")
+        good_bytes, bad_feedbacks = [], []
+        for img_bytes in gemini_bytes_list:
+            ev = claude_evaluate_photo(image_bytes=img_bytes)
             print(f"    → {ev.get('score',0)}/10: {ev.get('feedback','')}")
             if ev.get("ok"):
-                good_photos.append(url)
+                good_bytes.append(img_bytes)
             else:
-                bad_photos.append((url, ev))
+                bad_feedbacks.append(ev.get("feedback", ""))
 
-        if good_photos:
-            tg_send(f"✅ <b>{brand}</b>: {len(good_photos)}/{len(photos)} fotos aprobadas")
-            photos = good_photos
+        if good_bytes:
+            # Subir a fal.ai para obtener URLs públicas
+            photos = [fal_upload(b) for b in good_bytes]
+            tg_send(f"✅ <b>{brand}</b>: {len(photos)}/3 fotos Gemini aprobadas por Claude")
+            modelo_ia_usado = "gemini_tryon"
         else:
-            issues = "; ".join(
-                ev.get("feedback", "") for _, ev in bad_photos[:2] if ev.get("feedback")
-            )
+            issues = "; ".join(bad_feedbacks[:2])
             tg_send(
-                f"⚠️ <b>{brand}</b>: calidad baja detectada\n"
-                f"<i>{issues}</i>\n"
-                f"Revisá y decime si querés regenerar o está bien."
+                f"⚠️ <b>{brand}</b>: Gemini calidad insuficiente\n"
+                f"<i>{issues[:120]}</i>\n"
+                f"🔄 Pasando a Kling como fallback..."
             )
 
-    # ── Paso 4: Video con la primera foto aprobada ────────────────────────
+    # ── Paso 2: Fallback Kling/FASHN si Gemini no dio buenos resultados ──
+    if not photos:
+        model_url = fal_upload(model_bytes)
+
+        # Pre-procesar prenda antes del try-on (Gemini enhance → Pixelcut → ...)
+        enhanced_bytes, enhance_svc = enhance_garment_with_fallback(garment_bytes)
+        if enhanced_bytes:
+            tg_send(f"✅ <b>{brand}</b>: prenda mejorada por {enhance_svc}")
+        tryon_garment_url = fal_upload(enhanced_bytes) if enhanced_bytes else garment_url
+
+        photos = tryon_multi(tryon_garment_url, model_url, category, flat_lay=flat_lay, n=3)
+
+        if photos and ANTHROPIC_API_KEY:
+            tg_send(f"🔍 <b>{brand}</b>: Claude evaluando Kling...")
+            good_photos, bad_photos = [], []
+            for url in photos:
+                ev = claude_evaluate_photo(image_url=url)
+                print(f"    → {ev.get('score',0)}/10: {ev.get('feedback','')}")
+                if ev.get("ok"):
+                    good_photos.append(url)
+                else:
+                    bad_photos.append((url, ev))
+            if good_photos:
+                tg_send(f"✅ <b>{brand}</b>: {len(good_photos)}/{len(photos)} fotos Kling aprobadas")
+                photos = good_photos
+            else:
+                issues = "; ".join(ev.get("feedback","") for _, ev in bad_photos[:2] if ev.get("feedback"))
+                tg_send(
+                    f"⚠️ <b>{brand}</b>: calidad baja en Kling también\n"
+                    f"<i>{issues[:120]}</i>\n"
+                    f"Revisá y decime si querés regenerar."
+                )
+    else:
+        model_url = None  # Gemini no necesita modelo de referencia
+
+    # ── Paso 3: Video con la primera foto aprobada ────────────────────────
     video = ""
     if photos:
         try:
