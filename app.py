@@ -40,6 +40,15 @@ TIKTOK_APP_ID      = os.environ.get("TIKTOK_APP_ID", "")
 TIKTOK_APP_SECRET  = os.environ.get("TIKTOK_APP_SECRET", "")
 GITHUB_PAT         = os.environ.get("GITHUB_PAT", "")
 GITHUB_REPOSITORY  = os.environ.get("GITHUB_REPOSITORY", "Johnnybencu/marketing-hub")
+
+# ── AI Quality Pipeline ────────────────────────────────────────────────────────
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+PIXELCUT_API_KEY  = os.environ.get("PIXELCUT_API_KEY", "")
+KREA_API_KEY      = os.environ.get("KREA_API_KEY", "")
+ADOBE_CLIENT_ID   = os.environ.get("ADOBE_CLIENT_ID", "")
+ADOBE_CLIENT_SECRET = os.environ.get("ADOBE_CLIENT_SECRET", "")
+ZYNG_API_KEY      = os.environ.get("ZYNG_API_KEY", "")
 BOT_PUBLIC_URL     = os.environ.get("BOT_PUBLIC_URL", "https://web-production-71a27.up.railway.app")
 TIKTOK_REDIRECT    = f"{BOT_PUBLIC_URL}/tiktok-callback"
 
@@ -212,6 +221,217 @@ def detect_category(text):
     return "tops"
 
 
+# ── AI Quality Pipeline ────────────────────────────────────────────────────────
+
+def gemini_enhance_garment(garment_bytes):
+    """
+    Gemini 2.0 Flash: transforma una foto de campo (piso/depósito) en una foto
+    de producto limpia con fondo blanco, iluminación profesional.
+    Retorna bytes de la imagen mejorada, o None si falla / no hay API key.
+    """
+    if not GEMINI_API_KEY:
+        print("  [Gemini] Sin API key — skip")
+        return None
+    try:
+        from google import genai as google_genai
+        from google.genai import types as google_types
+
+        client = google_genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-preview-image-generation",
+            contents=[
+                google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
+                google_types.Part.from_text(
+                    "This is a raw garment photo taken in a warehouse or on the floor. "
+                    "Generate a professional e-commerce product photo of the EXACT SAME garment: "
+                    "pure white background, professional studio lighting, garment flat-lay or on invisible mannequin, "
+                    "sharp fabric details, exact same colors and design as the original. "
+                    "No floor, no warehouse, no wrinkles, no shadows. Photorealistic quality."
+                ),
+            ],
+            config=google_types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
+            ),
+        )
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data is not None:
+                print("  [Gemini] ✓ Prenda mejorada")
+                return part.inline_data.data  # bytes
+        print("  [Gemini] Sin imagen en respuesta")
+        return None
+    except Exception as e:
+        print(f"  [Gemini] Error: {e}")
+        return None
+
+
+def claude_evaluate_photo(image_url=None, image_bytes=None):
+    """
+    Claude evalúa la calidad de la foto para e-commerce fashion.
+    Retorna dict: {"score": int 1-10, "ok": bool, "issues": list, "feedback": str}
+    ok=True si score >= 7 y la prenda es claramente visible sin defectos graves.
+    Si no hay API key, devuelve aprobación por defecto (para no bloquear el flujo).
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"score": 7, "ok": True, "issues": [], "feedback": "sin evaluación"}
+
+    try:
+        import anthropic as anthropic_sdk
+        import json as _json
+        import re as _re
+
+        client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        if image_url:
+            img_content = {
+                "type": "image",
+                "source": {"type": "url", "url": image_url},
+            }
+        elif image_bytes:
+            img_content = {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode(),
+                },
+            }
+        else:
+            return {"score": 5, "ok": False, "issues": ["no image provided"], "feedback": ""}
+
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": [
+                    img_content,
+                    {
+                        "type": "text",
+                        "text": (
+                            "Evaluate this fashion e-commerce photo. Score 1-10 considering: "
+                            "garment clearly visible, no body/face distortions, no artifacts or blurs, "
+                            "professional look, fabric details preserved. "
+                            'Reply ONLY with JSON: {"score": X, "ok": true/false, "issues": ["..."], "feedback": "one short line"} '
+                            "ok=true if score>=7 and garment has no major defects."
+                        ),
+                    },
+                ],
+            }],
+        )
+
+        text = resp.content[0].text.strip()
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if m:
+            return _json.loads(m.group())
+        return {"score": 5, "ok": False, "issues": ["parse error"], "feedback": text[:80]}
+
+    except Exception as e:
+        print(f"  [Eval] Error Claude: {e}")
+        return {"score": 7, "ok": True, "issues": [], "feedback": f"eval error: {e}"}
+
+
+def pixelcut_enhance(garment_bytes):
+    """
+    Pixelcut API: elimina fondo y mejora foto de producto.
+    https://developer.pixelcut.ai/
+    Retorna bytes de la imagen con fondo removido, o None si falla.
+    """
+    if not PIXELCUT_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            "https://developer.pixelcut.ai/v1/images/remove-background",
+            headers={"X-API-Key": PIXELCUT_API_KEY, "Accept": "application/json"},
+            files={"image_file": ("garment.jpg", garment_bytes, "image/jpeg")},
+            data={"output_format": "jpg"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        img_url = result.get("result_url", "")
+        if img_url:
+            img_resp = requests.get(img_url, timeout=20)
+            print("  [Pixelcut] ✓ Fondo removido")
+            return img_resp.content
+        return None
+    except Exception as e:
+        print(f"  [Pixelcut] Error: {e}")
+        return None
+
+
+def krea_enhance(garment_bytes):
+    """
+    Krea.ai: upscale + mejora de imagen.
+    TODO: configurar KREA_API_KEY en Railway cuando tengas acceso a la API.
+    https://www.krea.ai/api
+    """
+    if not KREA_API_KEY:
+        return None
+    print("  [Krea] TODO: implementar cuando API key disponible")
+    return None
+
+
+def zyng_product_photo(garment_bytes):
+    """
+    Zyng.ai: foto de producto AI para e-commerce.
+    TODO: configurar ZYNG_API_KEY en Railway.
+    https://zyng.ai
+    """
+    if not ZYNG_API_KEY:
+        return None
+    print("  [Zyng] TODO: implementar cuando API key disponible")
+    return None
+
+
+def adobe_firefly_enhance(garment_bytes):
+    """
+    Adobe Firefly API: generative fill / image enhancement.
+    TODO: configurar ADOBE_CLIENT_ID y ADOBE_CLIENT_SECRET en Railway.
+    https://developer.adobe.com/firefly-api/
+    """
+    if not ADOBE_CLIENT_ID:
+        return None
+    print("  [Firefly] TODO: implementar cuando credenciales disponibles")
+    return None
+
+
+# Cascade ordenado para pre-procesar la prenda antes del try-on
+ENHANCE_CASCADE = [
+    ("Gemini",   gemini_enhance_garment),
+    ("Pixelcut", pixelcut_enhance),
+    ("Krea",     krea_enhance),
+    ("Zyng",     zyng_product_photo),
+    ("Firefly",  adobe_firefly_enhance),
+]
+
+
+def enhance_garment_with_fallback(garment_bytes):
+    """
+    Intenta mejorar la foto de la prenda usando el cascade de servicios.
+    Cada resultado es evaluado por Claude (score >= 7 para aceptar).
+    Retorna (enhanced_bytes, service_name) o (None, None) si todo falla.
+    """
+    for service_name, fn in ENHANCE_CASCADE:
+        try:
+            result_bytes = fn(garment_bytes)
+            if not result_bytes:
+                continue
+            eval_r = claude_evaluate_photo(image_bytes=result_bytes)
+            score  = eval_r.get("score", 0)
+            print(f"  [{service_name}] Eval: {score}/10 — {eval_r.get('feedback', '')}")
+            if eval_r.get("ok"):
+                return result_bytes, service_name
+            else:
+                issues = ", ".join(eval_r.get("issues", []))
+                print(f"  [{service_name}] Rechazada ({score}/10): {issues}")
+        except Exception as e:
+            print(f"  [{service_name}] Error en cascade: {e}")
+            continue
+
+    print("  [Cascade] Ningún servicio mejoró la prenda — usando original")
+    return None, None
+
+
 def _extract_style_keywords(caption, correction, flat_lay, category):
     """Extrae keywords de estilo para el feedback loop."""
     keywords = []
@@ -240,7 +460,7 @@ def _extract_style_keywords(caption, correction, flat_lay, category):
     return keywords or ["estudio"]
 
 
-def log_photo_session(brand, product_name, category, flat_lay, caption, correction, drive_url):
+def log_photo_session(brand, product_name, category, flat_lay, caption, correction, drive_url, modelo_ia="kling_v15"):
     """
     Loguea la sesión en data/photo_log.json del repo marketing-hub via GitHub API.
     Se usa para el feedback loop: cruzar estética de fotos con conversiones GA4.
@@ -257,7 +477,7 @@ def log_photo_session(brand, product_name, category, flat_lay, caption, correcti
         "categoria": category,
         "flat_lay": flat_lay,
         "keywords": _extract_style_keywords(caption, correction, flat_lay, category),
-        "modelo_ia": "kling_v15",
+        "modelo_ia": modelo_ia,
         "drive_url": drive_url,
     }
 
@@ -423,18 +643,55 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
 
     model_url = fal_upload(model_bytes)
 
-    # Try-on: Kling v1.5 como principal, FASHN como fallback
-    photos = tryon_multi(garment_url, model_url, category, flat_lay=flat_lay, n=3)
+    # ── Paso 1: Mejorar prenda con cascade (Gemini → Pixelcut → ...) ────────
+    tg_send(f"🔮 <b>{brand}</b>: mejorando imagen con IA...")
+    enhanced_bytes, enhance_service = enhance_garment_with_fallback(garment_bytes)
 
-    # Video con la primera foto
+    if enhanced_bytes:
+        tg_send(f"✅ <b>{brand}</b>: prenda mejorada por <b>{enhance_service}</b>")
+        tryon_garment_url = fal_upload(enhanced_bytes)
+        modelo_ia_usado   = f"{enhance_service.lower()}_kling"
+    else:
+        tryon_garment_url = garment_url
+        modelo_ia_usado   = "kling_v15"
+
+    # ── Paso 2: Try-on con prenda (mejorada o original) ───────────────────
+    photos = tryon_multi(tryon_garment_url, model_url, category, flat_lay=flat_lay, n=3)
+
+    # ── Paso 3: Evaluar resultados del try-on con Claude ─────────────────
+    if photos and ANTHROPIC_API_KEY:
+        tg_send(f"🔍 <b>{brand}</b>: evaluando {len(photos)} fotos con Claude...")
+        good_photos, bad_photos = [], []
+        for url in photos:
+            ev = claude_evaluate_photo(image_url=url)
+            print(f"    → {ev.get('score',0)}/10: {ev.get('feedback','')}")
+            if ev.get("ok"):
+                good_photos.append(url)
+            else:
+                bad_photos.append((url, ev))
+
+        if good_photos:
+            tg_send(f"✅ <b>{brand}</b>: {len(good_photos)}/{len(photos)} fotos aprobadas")
+            photos = good_photos
+        else:
+            issues = "; ".join(
+                ev.get("feedback", "") for _, ev in bad_photos[:2] if ev.get("feedback")
+            )
+            tg_send(
+                f"⚠️ <b>{brand}</b>: calidad baja detectada\n"
+                f"<i>{issues}</i>\n"
+                f"Revisá y decime si querés regenerar o está bien."
+            )
+
+    # ── Paso 4: Video con la primera foto aprobada ────────────────────────
     video = ""
     if photos:
         try:
             video = kling_video(photos[0], video_prompt)
         except Exception as e:
-            print(f"[KLING] Error: {e}")
+            print(f"[KLING] Error video: {e}")
 
-    return {"photos": photos, "video": video, "model_url": model_url}
+    return {"photos": photos, "video": video, "model_url": model_url, "modelo_ia": modelo_ia_usado}
 
 
 def send_previews(brand, result):
@@ -529,11 +786,12 @@ def save_to_drive(product_name):
 
             # Feedback loop: loguear sesión para cruzar con GA4 después
             with SESSION_LOCK:
-                _cap  = SESSION.get("caption", "")
-                _corr = SESSION.get("correction", "")
-                _fl   = SESSION.get("flat_lay", False)
-                _cat  = SESSION.get("category", "tops")
-            log_photo_session(brand, product_name, _cat, _fl, _cap, _corr, drive_link)
+                _cap      = SESSION.get("caption", "")
+                _corr     = SESSION.get("correction", "")
+                _fl       = SESSION.get("flat_lay", False)
+                _cat      = SESSION.get("category", "tops")
+                _modelo   = result.get("modelo_ia", "kling_v15")
+            log_photo_session(brand, product_name, _cat, _fl, _cap, _corr, drive_link, _modelo)
 
         except Exception as e:
             print(f"[DRIVE] Error {brand}: {e}")
