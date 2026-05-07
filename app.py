@@ -332,28 +332,31 @@ def claude_evaluate_photo(image_url=None, image_bytes=None):
 
 def pixelcut_enhance(garment_bytes):
     """
-    Pixelcut API: elimina fondo y mejora foto de producto.
-    https://developer.pixelcut.ai/
-    Retorna bytes de la imagen con fondo removido, o None si falla.
+    Pixelcut API: elimina fondo de foto de prenda.
+    Docs: https://pixa.com/docs/llms.txt
+    Endpoint: https://api.developer.pixelcut.ai/v1/remove-background
+    Retorna bytes PNG con fondo removido, o None si falla.
     """
     if not PIXELCUT_API_KEY:
         return None
     try:
+        # Subir prenda a fal.ai para obtener URL pública
+        garment_url = fal_upload(garment_bytes)
+
+        # Llamar a Pixelcut con la URL — devuelve imagen directamente (Accept: image/*)
         resp = requests.post(
-            "https://developer.pixelcut.ai/v1/images/remove-background",
-            headers={"X-API-Key": PIXELCUT_API_KEY, "Accept": "application/json"},
-            files={"image_file": ("garment.jpg", garment_bytes, "image/jpeg")},
-            data={"output_format": "jpg"},
+            "https://api.developer.pixelcut.ai/v1/remove-background",
+            headers={
+                "X-API-Key": PIXELCUT_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "image/*",
+            },
+            json={"image_url": garment_url},
             timeout=30,
         )
         resp.raise_for_status()
-        result = resp.json()
-        img_url = result.get("result_url", "")
-        if img_url:
-            img_resp = requests.get(img_url, timeout=20)
-            print("  [Pixelcut] ✓ Fondo removido")
-            return img_resp.content
-        return None
+        print("  [Pixelcut] ✓ Fondo removido")
+        return resp.content  # bytes PNG
     except Exception as e:
         print(f"  [Pixelcut] Error: {e}")
         return None
