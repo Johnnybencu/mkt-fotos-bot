@@ -241,7 +241,7 @@ def gemini_enhance_garment(garment_bytes):
             model="gemini-2.0-flash-preview-image-generation",
             contents=[
                 google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
-                google_types.Part.from_text(
+                (
                     "This is a raw garment photo taken in a warehouse or on the floor. "
                     "Generate a professional e-commerce product photo of the EXACT SAME garment: "
                     "pure white background, professional studio lighting, garment flat-lay or on invisible mannequin, "
@@ -533,8 +533,8 @@ def kling_tryon_single(garment_url, model_url, category="tops"):
     result = fal_client.run(
         "fal-ai/kling/v1-5/kolors-virtual-try-on",
         arguments={
-            "human_image":        model_url,
-            "garment_image":      garment_url,
+            "human_image_url":    model_url,
+            "garment_image_url":  garment_url,
             "garment_description": cat_desc.get(category, "upper body garment"),
         },
     )
