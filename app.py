@@ -394,7 +394,7 @@ def gemini_enhance_garment(garment_bytes):
             http_options={"api_version": "v1alpha"},
         )
         response = client.models.generate_content(
-            model="gemini-2.0-flash-preview-image-generation",
+            model="gemini-2.0-flash-exp-image-generation",
             contents=[
                 google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
                 (
@@ -629,9 +629,8 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
             try:
                 # Probar modelos en orden hasta que uno funcione
                 gemini_models = [
-                    "gemini-2.0-flash-exp",
+                    "gemini-2.0-flash-exp-image-generation",
                     "gemini-2.0-flash-preview-image-generation",
-                    "gemini-2.0-flash",
                 ]
                 resp = None
                 for model_name in gemini_models:
