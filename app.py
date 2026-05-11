@@ -621,16 +621,33 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
 
         def _one_call(_):
             try:
-                resp = client.models.generate_content(
-                    model="gemini-2.0-flash-preview-image-generation",
-                    contents=[
-                        google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
-                        prompt,
-                    ],
-                    config=google_types.GenerateContentConfig(
-                        response_modalities=["IMAGE", "TEXT"]
-                    ),
-                )
+                # Probar modelos en orden hasta que uno funcione
+                gemini_models = [
+                    "gemini-2.0-flash-exp",
+                    "gemini-2.0-flash-preview-image-generation",
+                    "gemini-2.0-flash",
+                ]
+                resp = None
+                for model_name in gemini_models:
+                    try:
+                        resp = client.models.generate_content(
+                            model=model_name,
+                            contents=[
+                                google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
+                                prompt,
+                            ],
+                            config=google_types.GenerateContentConfig(
+                                response_modalities=["IMAGE", "TEXT"]
+                            ),
+                        )
+                        print(f"  [Gemini] Usando modelo: {model_name}")
+                        break
+                    except Exception as me:
+                        print(f"  [Gemini] {model_name} falló: {me}")
+                        continue
+                if resp is None:
+                    print("  [Gemini] Ningún modelo disponible")
+                    return None
                 if not resp.candidates:
                     print("  [Gemini] Sin candidatos — posible bloqueo de contenido")
                     return None
