@@ -15,7 +15,7 @@ import base64
 import threading
 import requests
 from flask import Flask, request, jsonify, redirect
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fal_client
 
@@ -67,11 +67,11 @@ SESSION = {
     "phase":        "idle",  # idle | generating | previewing | waiting_name | saving
     "brands":       [],
     "garment_bytes": None,
-    "garment_url":  None,   # URL en fal.ai
+    "garment_url":  None,
     "category":     "tops",
-    "flat_lay":     False,  # True solo si foto con fondo blanco limpio
-    "caption":      "",     # caption original del usuario (para feedback loop)
-    "correction":   "",     # última corrección del usuario
+    "flat_lay":     False,
+    "caption":      "",
+    "correction":   "",
     "results": {
         # "Prany":     {"photos": [...], "video": "...", "model_url": "..."},
         # "Vainafash": {...},
@@ -111,6 +111,19 @@ def tg_send_photo(photo_url, caption=""):
         )
     except Exception as e:
         print(f"[TG] Error foto: {e}")
+
+
+def tg_send_photo_bytes(photo_bytes, caption=""):
+    """Manda una foto como bytes directamente (sin URL externa)."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"[TG] Error foto bytes: {e}")
 
 
 def tg_send_video(video_url, caption=""):
@@ -264,11 +277,11 @@ def gemini_enhance_garment(garment_bytes):
         return None
 
 
-def claude_evaluate_photo(image_url=None, image_bytes=None):
+def claude_evaluate_photo(image_url=None, image_bytes=None, min_score=8):
     """
     Claude evalúa la calidad de la foto para e-commerce fashion.
     Retorna dict: {"score": int 1-10, "ok": bool, "issues": list, "feedback": str}
-    ok=True si score >= 7 y la prenda es claramente visible sin defectos graves.
+    ok=True si score >= min_score (default 8 = excelente).
     Si no hay API key, devuelve aprobación por defecto (para no bloquear el flujo).
     """
     if not ANTHROPIC_API_KEY:
@@ -307,12 +320,13 @@ def claude_evaluate_photo(image_url=None, image_bytes=None):
                     img_content,
                     {
                         "type": "text",
+                        "type": "text",
                         "text": (
                             "Evaluate this fashion e-commerce photo. Score 1-10 considering: "
-                            "garment clearly visible, no body/face distortions, no artifacts or blurs, "
-                            "professional look, fabric details preserved. "
-                            'Reply ONLY with JSON: {"score": X, "ok": true/false, "issues": ["..."], "feedback": "one short line"} '
-                            "ok=true if score>=7 and garment has no major defects."
+                            "garment clearly visible with exact colors/design, realistic human body, "
+                            "no distortions or artifacts, professional studio quality, sharp fabric details. "
+                            f'Reply ONLY with JSON: {{"score": X, "ok": true/false, "issues": ["..."], "feedback": "one short line"}} '
+                            f"ok=true if score>={min_score} and photo is ready for professional e-commerce."
                         ),
                     },
                 ],
@@ -435,10 +449,11 @@ def enhance_garment_with_fallback(garment_bytes):
     return None, None
 
 
-def gemini_tryon(garment_bytes, n=3):
+def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
     """
     Gemini 2.0 Flash: genera n fotos de un modelo vistiendo la prenda.
-    Corre n llamadas en paralelo. Retorna lista de bytes (imágenes).
+    Corre n llamadas en paralelo. Si hay feedback_notes, ajusta el prompt.
+    Retorna lista de bytes (imágenes).
     """
     if not GEMINI_API_KEY:
         return []
@@ -448,19 +463,28 @@ def gemini_tryon(garment_bytes, n=3):
 
         client = google_genai.Client(api_key=GEMINI_API_KEY)
 
+        feedback_str = ""
+        if feedback_notes:
+            feedback_str = (
+                " CRITICAL — fix these issues from the previous attempt: "
+                + "; ".join(feedback_notes[:3]) + "."
+            )
+
+        prompt = (
+            "Generate a professional fashion e-commerce photo of a model wearing this EXACT garment. "
+            "Requirements: natural standing pose, clean white studio background, professional studio lighting, "
+            "exact same garment colors patterns and design, full body or 3/4 shot, "
+            "realistic human proportions, no body distortions, no face artifacts, "
+            "photorealistic high quality result."
+            + feedback_str
+        )
+
         def _one_call(_):
             resp = client.models.generate_content(
                 model="gemini-2.0-flash-preview-image-generation",
                 contents=[
                     google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
-                    (
-                        "This is a clothing/garment item. Generate a professional fashion e-commerce photo "
-                        "of a model wearing this EXACT garment. Requirements: "
-                        "natural standing pose, clean white or light studio background, "
-                        "professional studio lighting, exact same garment colors and design, "
-                        "full body or 3/4 shot, high quality photorealistic result. "
-                        "Do NOT add any other clothing or accessories not in the original."
-                    ),
+                    prompt,
                 ],
                 config=google_types.GenerateContentConfig(
                     response_modalities=["IMAGE", "TEXT"]
@@ -484,6 +508,74 @@ def gemini_tryon(garment_bytes, n=3):
     except Exception as e:
         print(f"  [Gemini tryon] Error: {e}")
         return []
+
+
+def generate_gemini_until_approved(garment_bytes, n=3, max_attempts=3, min_score=8):
+    """
+    Genera fotos con Gemini hasta que Claude apruebe (score >= min_score).
+    Incorpora el feedback de Claude en cada reintento para mejorar el prompt.
+    Solo devuelve fotos cuando son excelentes, o el mejor resultado tras max_attempts.
+    """
+    feedback_history = []
+    best = {"score": 0, "bytes_list": []}
+
+    for attempt in range(1, max_attempts + 1):
+        tg_send(
+            f"🔮 Gemini — intento {attempt}/{max_attempts} "
+            f"({n} fotos en paralelo)..."
+        )
+
+        notes = feedback_history if attempt > 1 else None
+        bytes_list = gemini_tryon(garment_bytes, n=n, feedback_notes=notes)
+
+        if not bytes_list:
+            tg_send(f"⚠️ Intento {attempt}: Gemini no generó imágenes, reintentando...")
+            continue
+
+        tg_send(f"🔍 Claude evaluando {len(bytes_list)} fotos (mínimo {min_score}/10)...")
+        approved, attempt_feedbacks = [], []
+
+        for img_bytes in bytes_list:
+            ev = claude_evaluate_photo(image_bytes=img_bytes, min_score=min_score)
+            score = ev.get("score", 0)
+            print(f"    → {score}/10: {ev.get('feedback', '')}")
+
+            # Guardar el mejor resultado global
+            if score > best["score"]:
+                best["score"] = score
+                best["bytes_list"] = [img_bytes]
+            elif score == best["score"] and score > 0:
+                best["bytes_list"].append(img_bytes)
+
+            if ev.get("ok"):
+                approved.append(img_bytes)
+            else:
+                fb = ev.get("feedback", "")
+                if fb:
+                    attempt_feedbacks.append(fb)
+
+        if approved:
+            tg_send(f"✅ {len(approved)}/{len(bytes_list)} fotos excelentes (intento {attempt})")
+            return approved
+
+        # No aprobadas — preparar próximo intento con feedback
+        feedback_history.extend(attempt_feedbacks)
+        if attempt < max_attempts:
+            issues = "; ".join(attempt_feedbacks[:2])
+            tg_send(
+                f"🔄 Intento {attempt}: mejor score {best['score']}/10 — ajustando...\n"
+                f"<i>{issues[:120]}</i>"
+            )
+
+    # Agotamos los intentos — enviar el mejor disponible con advertencia
+    if best["bytes_list"]:
+        tg_send(
+            f"⚠️ No se alcanzó el mínimo de {min_score}/10 en {max_attempts} intentos.\n"
+            f"Mejor resultado: <b>{best['score']}/10</b> — revisá y decime si regenero."
+        )
+        return best["bytes_list"][:2]
+
+    return []
 
 
 def _extract_style_keywords(caption, correction, flat_lay, category):
@@ -695,96 +787,57 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
     if correction:
         video_prompt = f"{video_prompt}, {correction}"
 
-    photos        = []
-    modelo_ia_usado = "kling_v15"
+    # ── Solo Gemini — reintenta hasta score >= 8 ─────────────────────────
+    photos_bytes = generate_gemini_until_approved(
+        garment_bytes, n=3, max_attempts=3, min_score=8
+    )
 
-    # ── Paso 1: Gemini genera fotos con modelo (principal) ────────────────
-    tg_send(f"🔮 <b>{brand}</b>: Gemini generando 3 fotos con modelo...")
-    gemini_bytes_list = gemini_tryon(garment_bytes, n=3)
+    if not photos_bytes:
+        tg_send(
+            f"❌ <b>{brand}</b>: Gemini no pudo generar fotos aceptables.\n"
+            f"Probá con otra foto de la prenda (más luz, fondo más limpio)."
+        )
+        return {"photos_bytes": [], "photos": [], "video": "", "modelo_ia": "gemini_tryon"}
 
-    if gemini_bytes_list:
-        tg_send(f"🔍 <b>{brand}</b>: Claude evaluando calidad Gemini...")
-        good_bytes, bad_feedbacks = [], []
-        for img_bytes in gemini_bytes_list:
-            ev = claude_evaluate_photo(image_bytes=img_bytes)
-            print(f"    → {ev.get('score',0)}/10: {ev.get('feedback','')}")
-            if ev.get("ok"):
-                good_bytes.append(img_bytes)
-            else:
-                bad_feedbacks.append(ev.get("feedback", ""))
-
-        if good_bytes:
-            # Subir a fal.ai para obtener URLs públicas
-            photos = [fal_upload(b) for b in good_bytes]
-            tg_send(f"✅ <b>{brand}</b>: {len(photos)}/3 fotos Gemini aprobadas por Claude")
-            modelo_ia_usado = "gemini_tryon"
-        else:
-            issues = "; ".join(bad_feedbacks[:2])
-            tg_send(
-                f"⚠️ <b>{brand}</b>: Gemini calidad insuficiente\n"
-                f"<i>{issues[:120]}</i>\n"
-                f"🔄 Pasando a Kling como fallback..."
-            )
-
-    # ── Paso 2: Fallback Kling/FASHN si Gemini no dio buenos resultados ──
-    if not photos:
-        model_url = fal_upload(model_bytes)
-
-        # Pre-procesar prenda antes del try-on (Gemini enhance → Pixelcut → ...)
-        enhanced_bytes, enhance_svc = enhance_garment_with_fallback(garment_bytes)
-        if enhanced_bytes:
-            tg_send(f"✅ <b>{brand}</b>: prenda mejorada por {enhance_svc}")
-        tryon_garment_url = fal_upload(enhanced_bytes) if enhanced_bytes else garment_url
-
-        photos = tryon_multi(tryon_garment_url, model_url, category, flat_lay=flat_lay, n=3)
-
-        if photos and ANTHROPIC_API_KEY:
-            tg_send(f"🔍 <b>{brand}</b>: Claude evaluando Kling...")
-            good_photos, bad_photos = [], []
-            for url in photos:
-                ev = claude_evaluate_photo(image_url=url)
-                print(f"    → {ev.get('score',0)}/10: {ev.get('feedback','')}")
-                if ev.get("ok"):
-                    good_photos.append(url)
-                else:
-                    bad_photos.append((url, ev))
-            if good_photos:
-                tg_send(f"✅ <b>{brand}</b>: {len(good_photos)}/{len(photos)} fotos Kling aprobadas")
-                photos = good_photos
-            else:
-                issues = "; ".join(ev.get("feedback","") for _, ev in bad_photos[:2] if ev.get("feedback"))
-                tg_send(
-                    f"⚠️ <b>{brand}</b>: calidad baja en Kling también\n"
-                    f"<i>{issues[:120]}</i>\n"
-                    f"Revisá y decime si querés regenerar."
-                )
-    else:
-        model_url = None  # Gemini no necesita modelo de referencia
-
-    # ── Paso 3: Video con la primera foto aprobada ────────────────────────
+    # ── Video: subir la mejor foto a fal.ai solo para Kling video ────────
     video = ""
-    if photos:
-        try:
-            video = kling_video(photos[0], video_prompt)
-        except Exception as e:
-            print(f"[KLING] Error video: {e}")
+    try:
+        best_url = fal_upload(photos_bytes[0])
+        video = kling_video(best_url, video_prompt)
+    except Exception as e:
+        print(f"[VIDEO] Error: {e}")
 
-    return {"photos": photos, "video": video, "model_url": model_url, "modelo_ia": modelo_ia_usado}
+    return {
+        "photos_bytes": photos_bytes,
+        "photos":       [],
+        "video":        video,
+        "model_url":    None,
+        "modelo_ia":    "gemini_tryon",
+    }
 
 
 def send_previews(brand, result):
     """Manda las fotos y video de una marca por Telegram."""
-    photos = result["photos"]
-    video  = result["video"]
+    photos_bytes = result.get("photos_bytes", [])
+    photos       = result.get("photos", [])   # URLs legacy
+    video        = result.get("video", "")
+    total        = len(photos_bytes) + len(photos)
 
-    tg_send(f"🎨 <b>{brand}</b> — {len(photos)} fotos{' + 1 video' if video else ''}:")
+    if total == 0:
+        return
+
+    tg_send(f"🎨 <b>{brand}</b> — {total} foto{'s' if total > 1 else ''}{' + 1 video' if video else ''}:")
+
+    for i, b in enumerate(photos_bytes):
+        tg_send_photo_bytes(b, f"{brand} — Foto {i+1}/{total}")
+        time.sleep(0.4)
 
     for i, url in enumerate(photos):
-        tg_send_photo(url, f"{brand} - Foto {i+1}/{len(photos)}")
+        tg_send_photo(url, f"{brand} — Foto {len(photos_bytes)+i+1}/{total}")
         time.sleep(0.4)
 
     if video:
-        tg_send_video(video, f"{brand} - Video")
+        tg_send_video(video, f"{brand} — Video")
 
 
 def run_generation(brands, garment_bytes, category, correction="", flat_lay=False):
@@ -794,18 +847,14 @@ def run_generation(brands, garment_bytes, category, correction="", flat_lay=Fals
     """
     set_phase("generating")
 
-    # Subir prenda a fal.ai (una sola vez, compartida entre marcas)
-    tg_send("⬆️ Subiendo prenda a IA...")
-    garment_url = fal_upload(garment_bytes)
-
     with SESSION_LOCK:
-        SESSION["garment_url"] = garment_url
+        SESSION["garment_url"] = None
         SESSION["results"] = {}
 
     for brand in brands:
-        tg_send(f"🔄 <b>{brand}</b>: generando fotos (1-2 min)... ☕")
+        tg_send(f"🔄 <b>{brand}</b>: generando fotos (puede tardar 2-3 min)... ☕")
         try:
-            result = generate_for_brand(brand, garment_bytes, garment_url, category, correction, flat_lay)
+            result = generate_for_brand(brand, garment_bytes, None, category, correction, flat_lay)
             with SESSION_LOCK:
                 SESSION["results"][brand] = result
             send_previews(brand, result)
@@ -848,9 +897,15 @@ def save_to_drive(product_name):
         try:
             subfolder_id = drive_create_folder(folder_name, parent_folder, drive_token)
 
-            for i, img_url in enumerate(result["photos"]):
-                img_bytes = requests.get(img_url, timeout=30).content
+            # Fotos desde bytes (Gemini) — subida directa sin descarga
+            photos_bytes = result.get("photos_bytes", [])
+            for i, img_bytes in enumerate(photos_bytes):
                 drive_upload(f"foto_{i+1}.jpg", img_bytes, "image/jpeg", subfolder_id, drive_token)
+
+            # Fotos desde URL (legacy) — descargar y subir
+            for j, img_url in enumerate(result.get("photos", [])):
+                img_bytes = requests.get(img_url, timeout=30).content
+                drive_upload(f"foto_{len(photos_bytes)+j+1}.jpg", img_bytes, "image/jpeg", subfolder_id, drive_token)
 
             if result["video"]:
                 vid_bytes = requests.get(result["video"], timeout=60).content
@@ -877,13 +932,14 @@ def save_to_drive(product_name):
 
     tg_send("🎉 ¡Todo guardado! Mandame otra foto cuando quieras.")
     with SESSION_LOCK:
-        SESSION["phase"]        = "idle"
-        SESSION["brands"]       = []
+        SESSION["phase"]         = "idle"
+        SESSION["brands"]        = []
         SESSION["garment_bytes"] = None
-        SESSION["garment_url"]  = None
-        SESSION["flat_lay"]     = False
-        SESSION["results"]      = {}
-        SESSION["correction"]   = ""
+        SESSION["garment_url"]   = None
+        SESSION["flat_lay"]      = False
+        SESSION["caption"]       = ""
+        SESSION["correction"]    = ""
+        SESSION["results"]       = {}
 
 
 # ── Handlers de mensajes ───────────────────────────────────────────────────────
