@@ -389,7 +389,10 @@ def gemini_enhance_garment(garment_bytes):
         from google import genai as google_genai
         from google.genai import types as google_types
 
-        client = google_genai.Client(api_key=GEMINI_API_KEY)
+        client = google_genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"api_version": "v1alpha"},
+        )
         response = client.models.generate_content(
             model="gemini-2.0-flash-preview-image-generation",
             contents=[
@@ -601,7 +604,10 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
         from google import genai as google_genai
         from google.genai import types as google_types
 
-        client = google_genai.Client(api_key=GEMINI_API_KEY)
+        client = google_genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"api_version": "v1alpha"},
+        )
 
         feedback_str = ""
         if feedback_notes:
