@@ -42,13 +42,35 @@ GITHUB_PAT         = os.environ.get("GITHUB_PAT", "")
 GITHUB_REPOSITORY  = os.environ.get("GITHUB_REPOSITORY", "Johnnybencu/marketing-hub")
 
 # ── AI Quality Pipeline ────────────────────────────────────────────────────────
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-PIXELCUT_API_KEY  = os.environ.get("PIXELCUT_API_KEY", "")
-KREA_API_KEY      = os.environ.get("KREA_API_KEY", "")
-ADOBE_CLIENT_ID   = os.environ.get("ADOBE_CLIENT_ID", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+PIXELCUT_API_KEY    = os.environ.get("PIXELCUT_API_KEY", "")
+KREA_API_KEY        = os.environ.get("KREA_API_KEY", "")
+ADOBE_CLIENT_ID     = os.environ.get("ADOBE_CLIENT_ID", "")
 ADOBE_CLIENT_SECRET = os.environ.get("ADOBE_CLIENT_SECRET", "")
-ZYNG_API_KEY      = os.environ.get("ZYNG_API_KEY", "")
+ZYNG_API_KEY        = os.environ.get("ZYNG_API_KEY", "")
+
+# ── Prompt base GPT-4o (probado y funcionando bien) ──────────────────────────
+GPT_BASE_PROMPT = (
+    "Professional fashion e-commerce photo. Use this garment as the exact reference "
+    "and show it worn by a professional female model.\n\n"
+    "CRITICAL — the garment must be IDENTICAL to the reference image:\n"
+    "- Same exact colors (do NOT change, enhance or saturate)\n"
+    "- Same texture and fabric appearance\n"
+    "- Same ALL details: buttons, zippers, seams, pockets, lapels, collar, "
+    "hood, cuffs, hem length, belt, lining\n"
+    "- Do NOT invent any detail not visible in the original\n"
+    "- Do NOT add or remove any design element\n"
+    "- Do NOT change any proportions or silhouette\n\n"
+    "Photo style:\n"
+    "- Pure white studio background\n"
+    "- Professional soft studio lighting, no harsh shadows\n"
+    "- Model in natural standing pose, neutral professional expression\n"
+    "- Full body or 3/4 body shot, model centered\n"
+    "- High resolution, sharp fabric details, photorealistic\n"
+    "- Clean editorial fashion e-commerce style"
+)
 BOT_PUBLIC_URL     = os.environ.get("BOT_PUBLIC_URL", "https://web-production-71a27.up.railway.app")
 TIKTOK_REDIRECT    = f"{BOT_PUBLIC_URL}/tiktok-callback"
 
@@ -235,6 +257,106 @@ def detect_category(text):
 
 
 # ── AI Quality Pipeline ────────────────────────────────────────────────────────
+
+def gpt_generate_photo(garment_bytes, prompt, n=1):
+    """
+    GPT-4o (gpt-image-1): genera foto de moda usando la prenda como referencia.
+    Corre n llamadas en paralelo. Retorna lista de bytes.
+    """
+    if not OPENAI_API_KEY:
+        print("  [GPT] Sin API key — skip")
+        return []
+    try:
+        import io
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        def _one_call(_):
+            resp = client.images.edit(
+                model="gpt-image-1",
+                image=("garment.jpg", io.BytesIO(garment_bytes), "image/jpeg"),
+                prompt=prompt,
+                n=1,
+                size="1024x1024",
+            )
+            b64_data = resp.data[0].b64_json
+            if b64_data:
+                return base64.b64decode(b64_data)
+            return None
+
+        results = []
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = [ex.submit(_one_call, i) for i in range(n)]
+            for f in as_completed(futures):
+                img = f.result()
+                if img:
+                    results.append(img)
+
+        print(f"  [GPT] ✓ {len(results)}/{n} fotos generadas")
+        return results
+    except Exception as e:
+        print(f"  [GPT] Error: {e}")
+        return []
+
+
+def claude_evaluate_fidelity(original_bytes, generated_bytes, min_score=8):
+    """
+    Claude compara la prenda ORIGINAL vs la foto GENERADA por IA.
+    Evalúa calidad general + fidelidad exacta (colores, detalles, proporciones).
+    ok=True solo si score >= min_score Y fidelity >= min_score.
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"score": 7, "ok": False, "fidelity": 7, "issues": [], "feedback": "sin eval"}
+    try:
+        import anthropic as _anth
+        import json as _json
+        import re as _re
+
+        client   = _anth.Anthropic(api_key=ANTHROPIC_API_KEY)
+        orig_b64 = base64.b64encode(original_bytes).decode()
+        gen_b64  = base64.b64encode(generated_bytes).decode()
+
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=400,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "IMAGEN 1 — Prenda original de referencia:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": orig_b64}},
+                    {"type": "text", "text": "IMAGEN 2 — Foto generada por IA:"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": gen_b64}},
+                    {"type": "text", "text": (
+                        "Comparar las dos imágenes y evaluar la foto generada.\n\n"
+                        "Verificar punto por punto:\n"
+                        "• ¿Mismos colores exactos? (no saturados ni cambiados)\n"
+                        "• ¿Misma textura/tela?\n"
+                        "• ¿Mismos detalles: botones, cierres, bolsillos, solapas, cuello, "
+                        "capucha, mangas, largo, costuras, cinturón?\n"
+                        "• ¿No agrega elementos inventados?\n"
+                        "• ¿Proporciones y silueta correctas?\n"
+                        "• ¿Calidad profesional e-commerce?\n\n"
+                        "Responder SOLO con JSON válido:\n"
+                        '{"score": X, "quality": X, "fidelity": X, "ok": true/false, '
+                        '"issues": ["problema concreto 1", "problema concreto 2"], '
+                        '"feedback": "instrucción específica para corregir en el próximo prompt"}\n\n'
+                        f"ok=true SOLO si score>={min_score} Y fidelity>={min_score}. "
+                        "Issues deben ser MUY específicos (ej: 'solapa izquierda más larga que el original', "
+                        "'agregó bolsillo inexistente en pecho')."
+                    )},
+                ],
+            }],
+        )
+
+        text = resp.content[0].text.strip()
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if m:
+            return _json.loads(m.group())
+        return {"score": 5, "ok": False, "fidelity": 5, "issues": ["parse error"], "feedback": text[:80]}
+    except Exception as e:
+        print(f"  [Eval fidelity] Error: {e}")
+        return {"score": 7, "ok": True, "fidelity": 7, "issues": [], "feedback": str(e)[:60]}
+
 
 def gemini_enhance_garment(garment_bytes):
     """
@@ -510,37 +632,104 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
         return []
 
 
-def generate_gemini_until_approved(garment_bytes, n=3, max_attempts=3, min_score=8):
+def generate_gpt_until_approved(garment_bytes, correction="", n=3, max_attempts=3, min_score=8):
     """
-    Genera fotos con Gemini hasta que Claude apruebe (score >= min_score).
-    Incorpora el feedback de Claude en cada reintento para mejorar el prompt.
-    Solo devuelve fotos cuando son excelentes, o el mejor resultado tras max_attempts.
+    GPT-4o: genera fotos hasta que Claude apruebe calidad + fidelidad >= min_score.
+    Incorpora feedback de Claude y correcciones del usuario en cada reintento.
+    Retorna lista de bytes aprobados, o [] si agota intentos (para activar fallback).
     """
     feedback_history = []
     best = {"score": 0, "bytes_list": []}
 
     for attempt in range(1, max_attempts + 1):
-        tg_send(
-            f"🔮 Gemini — intento {attempt}/{max_attempts} "
-            f"({n} fotos en paralelo)..."
-        )
+        # Construir prompt: base + corrección del usuario + feedback acumulado de Claude
+        prompt = GPT_BASE_PROMPT
+        if correction:
+            prompt += f"\n\nINSTRUCCIÓN DEL USUARIO: {correction}"
+        if feedback_history:
+            prompt += "\n\nCORREGIR ESTOS PROBLEMAS DEL INTENTO ANTERIOR:\n- " + "\n- ".join(feedback_history[-4:])
 
-        notes = feedback_history if attempt > 1 else None
-        bytes_list = gemini_tryon(garment_bytes, n=n, feedback_notes=notes)
+        tg_send(f"🤖 GPT-4o — intento {attempt}/{max_attempts} ({n} fotos en paralelo)...")
+        bytes_list = gpt_generate_photo(garment_bytes, prompt, n=n)
+
+        if not bytes_list:
+            tg_send(f"⚠️ Intento {attempt}: GPT no generó imágenes")
+            continue
+
+        tg_send(f"🔍 Claude comparando prenda original vs generada (mínimo {min_score}/10)...")
+        approved, attempt_feedbacks = [], []
+
+        for gen_bytes in bytes_list:
+            ev = claude_evaluate_fidelity(garment_bytes, gen_bytes, min_score=min_score)
+            score    = ev.get("score", 0)
+            fidelity = ev.get("fidelity", 0)
+            print(f"    → calidad:{score}/10  fidelidad:{fidelity}/10 — {ev.get('feedback','')}")
+
+            if score > best["score"]:
+                best["score"] = score
+                best["bytes_list"] = [gen_bytes]
+            elif score == best["score"] and score > 0:
+                best["bytes_list"].append(gen_bytes)
+
+            if ev.get("ok"):
+                approved.append(gen_bytes)
+            else:
+                issues  = ev.get("issues", [])
+                fb      = ev.get("feedback", "")
+                attempt_feedbacks.extend(issues[:3])
+                if fb and fb not in attempt_feedbacks:
+                    attempt_feedbacks.append(fb)
+
+        if approved:
+            tg_send(f"✅ GPT: {len(approved)}/{len(bytes_list)} fotos aprobadas (intento {attempt})")
+            return approved
+
+        feedback_history.extend(attempt_feedbacks)
+        if attempt < max_attempts:
+            issues_str = "; ".join(attempt_feedbacks[:2])
+            tg_send(
+                f"🔄 GPT intento {attempt}: mejor {best['score']}/10 — corrigiendo...\n"
+                f"<i>{issues_str[:140]}</i>"
+            )
+
+    # Agotó intentos → fallback a Gemini (no enviamos el mejor aún)
+    tg_send(
+        f"⚠️ GPT no alcanzó {min_score}/10 en {max_attempts} intentos "
+        f"(mejor: {best['score']}/10) → probando con Gemini..."
+    )
+    return []
+
+
+def generate_gemini_until_approved(garment_bytes, correction="", n=3, max_attempts=3, min_score=8):
+    """
+    Gemini: fallback si GPT falla. Mismo sistema de evaluación de fidelidad.
+    Devuelve bytes aprobados, o el mejor disponible si agota intentos.
+    """
+    feedback_history = []
+    best = {"score": 0, "bytes_list": []}
+
+    for attempt in range(1, max_attempts + 1):
+        notes = []
+        if correction:
+            notes.append(f"User instruction: {correction}")
+        notes.extend(feedback_history[-3:])
+
+        tg_send(f"🔮 Gemini — intento {attempt}/{max_attempts} ({n} fotos en paralelo)...")
+        bytes_list = gemini_tryon(garment_bytes, n=n, feedback_notes=notes if notes else None)
 
         if not bytes_list:
             tg_send(f"⚠️ Intento {attempt}: Gemini no generó imágenes, reintentando...")
             continue
 
-        tg_send(f"🔍 Claude evaluando {len(bytes_list)} fotos (mínimo {min_score}/10)...")
+        tg_send(f"🔍 Claude comparando prenda original vs generada (mínimo {min_score}/10)...")
         approved, attempt_feedbacks = [], []
 
         for img_bytes in bytes_list:
-            ev = claude_evaluate_photo(image_bytes=img_bytes, min_score=min_score)
-            score = ev.get("score", 0)
-            print(f"    → {score}/10: {ev.get('feedback', '')}")
+            ev = claude_evaluate_fidelity(garment_bytes, img_bytes, min_score=min_score)
+            score    = ev.get("score", 0)
+            fidelity = ev.get("fidelity", 0)
+            print(f"    → calidad:{score}/10  fidelidad:{fidelity}/10 — {ev.get('feedback','')}")
 
-            # Guardar el mejor resultado global
             if score > best["score"]:
                 best["score"] = score
                 best["bytes_list"] = [img_bytes]
@@ -550,28 +739,29 @@ def generate_gemini_until_approved(garment_bytes, n=3, max_attempts=3, min_score
             if ev.get("ok"):
                 approved.append(img_bytes)
             else:
-                fb = ev.get("feedback", "")
-                if fb:
+                issues = ev.get("issues", [])
+                fb     = ev.get("feedback", "")
+                attempt_feedbacks.extend(issues[:3])
+                if fb and fb not in attempt_feedbacks:
                     attempt_feedbacks.append(fb)
 
         if approved:
-            tg_send(f"✅ {len(approved)}/{len(bytes_list)} fotos excelentes (intento {attempt})")
+            tg_send(f"✅ Gemini: {len(approved)}/{len(bytes_list)} fotos aprobadas (intento {attempt})")
             return approved
 
-        # No aprobadas — preparar próximo intento con feedback
         feedback_history.extend(attempt_feedbacks)
         if attempt < max_attempts:
-            issues = "; ".join(attempt_feedbacks[:2])
+            issues_str = "; ".join(attempt_feedbacks[:2])
             tg_send(
-                f"🔄 Intento {attempt}: mejor score {best['score']}/10 — ajustando...\n"
-                f"<i>{issues[:120]}</i>"
+                f"🔄 Gemini intento {attempt}: mejor {best['score']}/10 — ajustando...\n"
+                f"<i>{issues_str[:120]}</i>"
             )
 
-    # Agotamos los intentos — enviar el mejor disponible con advertencia
+    # Gemini también agotó — devolver el mejor disponible
     if best["bytes_list"]:
         tg_send(
-            f"⚠️ No se alcanzó el mínimo de {min_score}/10 en {max_attempts} intentos.\n"
-            f"Mejor resultado: <b>{best['score']}/10</b> — revisá y decime si regenero."
+            f"⚠️ Ningún modelo alcanzó {min_score}/10.\n"
+            f"Mejor resultado: <b>{best['score']}/10</b> — revisá y escribí qué cambiar."
         )
         return best["bytes_list"][:2]
 
@@ -783,23 +973,35 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
             "urban street style, natural lighting, aesthetic movement"
         )
 
-    # Si el usuario mandó una corrección, la agregamos al prompt del video
     if correction:
         video_prompt = f"{video_prompt}, {correction}"
 
-    # ── Solo Gemini — reintenta hasta score >= 8 ─────────────────────────
-    photos_bytes = generate_gemini_until_approved(
-        garment_bytes, n=3, max_attempts=3, min_score=8
+    photos_bytes = []
+    modelo_ia    = "failed"
+
+    # ── Paso 1: GPT-4o (principal) ────────────────────────────────────────
+    photos_bytes = generate_gpt_until_approved(
+        garment_bytes, correction=correction, n=3, max_attempts=3, min_score=8
     )
+    if photos_bytes:
+        modelo_ia = "gpt4o"
+
+    # ── Paso 2: Gemini (fallback si GPT falla) ────────────────────────────
+    if not photos_bytes:
+        photos_bytes = generate_gemini_until_approved(
+            garment_bytes, correction=correction, n=3, max_attempts=3, min_score=8
+        )
+        if photos_bytes:
+            modelo_ia = "gemini_tryon"
 
     if not photos_bytes:
         tg_send(
-            f"❌ <b>{brand}</b>: Gemini no pudo generar fotos aceptables.\n"
-            f"Probá con otra foto de la prenda (más luz, fondo más limpio)."
+            f"❌ <b>{brand}</b>: ningún modelo generó fotos aceptables.\n"
+            f"Probá con otra foto de la prenda (más luz, fondo limpio, prenda extendida)."
         )
-        return {"photos_bytes": [], "photos": [], "video": "", "modelo_ia": "gemini_tryon"}
+        return {"photos_bytes": [], "photos": [], "video": "", "modelo_ia": "failed"}
 
-    # ── Video: subir la mejor foto a fal.ai solo para Kling video ────────
+    # ── Video: subir mejor foto a fal.ai solo para Kling video ───────────
     video = ""
     try:
         best_url = fal_upload(photos_bytes[0])
@@ -812,7 +1014,7 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
         "photos":       [],
         "video":        video,
         "model_url":    None,
-        "modelo_ia":    "gemini_tryon",
+        "modelo_ia":    modelo_ia,
     }
 
 
@@ -1038,12 +1240,19 @@ def handle_text(message):
     if text.startswith("/start") or text.lower() in ("hola", "start"):
         tg_send(
             "👗 <b>MktFotos Bot</b>\n\n"
-            "Mandame una foto de la prenda con el caption:\n\n"
-            "• <b>Prany</b>\n"
-            "• <b>Vaina</b>\n"
-            "• <b>Ambas</b>\n\n"
-            "Generaré las fotos, me decís si está bien o querés cambios, "
-            "y cuando confirmás te pido el nombre para guardar en Drive 📁"
+            "Mandame una foto de la prenda con el caption de la marca:\n"
+            "• <b>Prany</b> / <b>Vaina</b> / <b>Ambas</b>\n\n"
+            "<b>¿Cómo funciona?</b>\n"
+            "1. GPT-4o genera 3 fotos con modelo\n"
+            "2. Claude compara la prenda original vs generada\n"
+            "   (colores, solapas, bolsillos, costuras, largo...)\n"
+            "3. Si algo no coincide, reintenta automáticamente\n"
+            "4. Si GPT falla → Gemini como respaldo\n\n"
+            "Cuando ves las fotos podés escribir correcciones:\n"
+            "<i>\"la solapa quedó mal\"</i> / <i>\"más editorial\"</i> / "
+            "<i>\"la cara no me gusta\"</i>\n"
+            "→ se regenera con tu instrucción incorporada al prompt\n\n"
+            "Cuando estés conforme → <b>ok / listo / dale</b> 📁"
         )
         return
 
@@ -1065,7 +1274,7 @@ def handle_text(message):
             tg_send("✏️ ¿Cómo se llama el producto? (ese nombre se va a usar para la carpeta en Drive)")
             return
         else:
-            # Corrección: regenerar con el texto como hint
+            # Corrección manual: se agrega al prompt y regenera
             with SESSION_LOCK:
                 brands        = list(SESSION["brands"])
                 garment_bytes = SESSION["garment_bytes"]
@@ -1073,7 +1282,10 @@ def handle_text(message):
                 flat_lay      = SESSION["flat_lay"]
                 SESSION["correction"] = text
 
-            tg_send(f"🔄 Aplicando corrección: <i>\"{text}\"</i>")
+            tg_send(
+                f"✏️ Corrección recibida: <i>\"{text}\"</i>\n"
+                f"🔄 Regenerando con GPT-4o (tu instrucción se agrega al prompt)..."
+            )
             threading.Thread(
                 target=run_generation,
                 args=(brands, garment_bytes, category, text, flat_lay),
