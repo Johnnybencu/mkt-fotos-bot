@@ -260,29 +260,47 @@ def detect_category(text):
 
 def gpt_generate_photo(garment_bytes, prompt, n=1):
     """
-    GPT-4o (gpt-image-1): genera foto de moda usando la prenda como referencia.
+    GPT-4o via Responses API: genera foto de moda con la prenda como referencia.
+    Usa image_generation tool — más accesible que gpt-image-1.
     Corre n llamadas en paralelo. Retorna lista de bytes.
     """
     if not OPENAI_API_KEY:
         print("  [GPT] Sin API key — skip")
         return []
     try:
-        import io
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client    = OpenAI(api_key=OPENAI_API_KEY)
+        b64_image = base64.b64encode(garment_bytes).decode()
 
         def _one_call(_):
-            resp = client.images.edit(
-                model="gpt-image-1",
-                image=("garment.jpg", io.BytesIO(garment_bytes), "image/jpeg"),
-                prompt=prompt,
-                n=1,
-                size="1024x1024",
-            )
-            b64_data = resp.data[0].b64_json
-            if b64_data:
-                return base64.b64decode(b64_data)
-            return None
+            try:
+                resp = client.responses.create(
+                    model="gpt-4o",
+                    input=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{b64_image}",
+                            },
+                            {
+                                "type": "input_text",
+                                "text": prompt,
+                            },
+                        ],
+                    }],
+                    tools=[{"type": "image_generation"}],
+                )
+                for item in resp.output:
+                    if getattr(item, "type", "") == "image_generation_call":
+                        result = getattr(item, "result", None)
+                        if result:
+                            return base64.b64decode(result)
+                print("  [GPT] Sin imagen en respuesta output")
+                return None
+            except Exception as e:
+                print(f"  [GPT call] Error: {e}")
+                return None
 
         results = []
         with ThreadPoolExecutor(max_workers=n) as ex:
@@ -295,7 +313,7 @@ def gpt_generate_photo(garment_bytes, prompt, n=1):
         print(f"  [GPT] ✓ {len(results)}/{n} fotos generadas")
         return results
     except Exception as e:
-        print(f"  [GPT] Error: {e}")
+        print(f"  [GPT] Error fatal: {e}")
         return []
 
 
@@ -602,20 +620,30 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
         )
 
         def _one_call(_):
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash-preview-image-generation",
-                contents=[
-                    google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
-                    prompt,
-                ],
-                config=google_types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"]
-                ),
-            )
-            for part in resp.candidates[0].content.parts:
-                if hasattr(part, "inline_data") and part.inline_data is not None:
-                    return part.inline_data.data
-            return None
+            try:
+                resp = client.models.generate_content(
+                    model="gemini-2.0-flash-preview-image-generation",
+                    contents=[
+                        google_types.Part.from_bytes(data=garment_bytes, mime_type="image/jpeg"),
+                        prompt,
+                    ],
+                    config=google_types.GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"]
+                    ),
+                )
+                if not resp.candidates:
+                    print("  [Gemini] Sin candidatos — posible bloqueo de contenido")
+                    return None
+                for part in resp.candidates[0].content.parts:
+                    if hasattr(part, "inline_data") and part.inline_data is not None:
+                        return part.inline_data.data
+                    if hasattr(part, "text") and part.text:
+                        print(f"  [Gemini] Texto en respuesta: {part.text[:120]}")
+                print("  [Gemini] Sin imagen en las partes de respuesta")
+                return None
+            except Exception as e:
+                print(f"  [Gemini call] Error: {e}")
+                return None
 
         results = []
         with ThreadPoolExecutor(max_workers=n) as ex:
