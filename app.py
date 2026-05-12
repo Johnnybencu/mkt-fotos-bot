@@ -51,25 +51,49 @@ ADOBE_CLIENT_ID     = os.environ.get("ADOBE_CLIENT_ID", "")
 ADOBE_CLIENT_SECRET = os.environ.get("ADOBE_CLIENT_SECRET", "")
 ZYNG_API_KEY        = os.environ.get("ZYNG_API_KEY", "")
 
-# ── Prompt base GPT-4o (probado y funcionando bien) ──────────────────────────
+# ── Prompts GPT-4o por marca ──────────────────────────────────────────────────
 GPT_BASE_PROMPT = (
-    "Professional fashion e-commerce photo. Use this garment as the exact reference "
+    "Professional fashion e-commerce photo. Use this garment as the EXACT reference "
     "and show it worn by a professional female model.\n\n"
-    "CRITICAL — the garment must be IDENTICAL to the reference image:\n"
-    "- Same exact colors (do NOT change, enhance or saturate)\n"
-    "- Same texture and fabric appearance\n"
-    "- Same ALL details: buttons, zippers, seams, pockets, lapels, collar, "
-    "hood, cuffs, hem length, belt, lining\n"
-    "- Do NOT invent any detail not visible in the original\n"
-    "- Do NOT add or remove any design element\n"
-    "- Do NOT change any proportions or silhouette\n\n"
-    "Photo style:\n"
-    "- Pure white studio background\n"
-    "- Professional soft studio lighting, no harsh shadows\n"
-    "- Model in natural standing pose, neutral professional expression\n"
-    "- Full body or 3/4 body shot, model centered\n"
-    "- High resolution, sharp fabric details, photorealistic\n"
-    "- Clean editorial fashion e-commerce style"
+    "CRITICAL GARMENT FIDELITY — replicate EVERY detail with zero deviation:\n"
+    "- COLORS: exact same hue, saturation and value — do NOT brighten, darken or shift any color\n"
+    "- FABRIC: same texture, weave, sheen and weight appearance\n"
+    "- BUTTONS: same quantity, size, color and exact placement\n"
+    "- ZIPPERS: same type (exposed/hidden), color, length and position\n"
+    "- POCKETS: same number, shape, position and style (patch/welt/flap)\n"
+    "- COLLAR: exact same shape and construction (turtleneck/lapel/crew/hood etc)\n"
+    "- SLEEVES: same length, cuff style and width\n"
+    "- HEM: same length and finish (straight/asymmetric/curved)\n"
+    "- SEAMS & STITCHING: replicate visible seam lines and topstitching\n"
+    "- PRINTS & PATTERNS: exact same graphic, stripe, check or texture\n"
+    "- Do NOT invent any detail not visible in the reference\n"
+    "- Do NOT add or remove ANY design element\n"
+    "- Do NOT alter proportions or silhouette in any way\n\n"
+    "Photo requirements:\n"
+    "- Pure white seamless studio background\n"
+    "- Soft professional studio lighting, no harsh shadows\n"
+    "- Full body or 3/4 shot, model centered and standing naturally\n"
+    "- High resolution, tack-sharp fabric detail, photorealistic quality"
+)
+
+GPT_PROMPT_PRANY = (
+    GPT_BASE_PROMPT + "\n\n"
+    "Brand style — PRANY (sophisticated Argentine fashion):\n"
+    "- Model: tall, slender, brunette or dark hair, Southern European look, 20-28 years old\n"
+    "- Expression: calm, confident, neutral — high-fashion editorial\n"
+    "- Pose: straight, elegant, hands relaxed at sides or one hand slightly raised\n"
+    "- Aesthetic: clean minimalist editorial — think Zara or Massimo Dutti campaign\n"
+    "- Lighting: bright, even, soft — no dramatic shadows"
+)
+
+GPT_PROMPT_VAINA = (
+    GPT_BASE_PROMPT + "\n\n"
+    "Brand style — VAINAFASH (trendy urban streetwear):\n"
+    "- Model: young, energetic, diverse look, 18-26 years old\n"
+    "- Expression: natural, slightly relaxed, approachable — lifestyle feel\n"
+    "- Pose: relaxed, slightly asymmetric — weight on one leg, casual attitude\n"
+    "- Aesthetic: fresh contemporary e-commerce — think ASOS or Urban Outfitters\n"
+    "- Lighting: bright, clean, modern studio"
 )
 BOT_PUBLIC_URL     = os.environ.get("BOT_PUBLIC_URL", "https://web-production-71a27.up.railway.app")
 TIKTOK_REDIRECT    = f"{BOT_PUBLIC_URL}/tiktok-callback"
@@ -336,31 +360,46 @@ def claude_evaluate_fidelity(original_bytes, generated_bytes, min_score=8):
 
         resp = client.messages.create(
             model="claude-opus-4-5",
-            max_tokens=400,
+            max_tokens=600,
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "IMAGEN 1 — Prenda original de referencia:"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": orig_b64}},
-                    {"type": "text", "text": "IMAGEN 2 — Foto generada por IA:"},
+                    {"type": "text", "text": "IMAGEN 2 — Foto generada por IA (modelo vistiendo la prenda):"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": gen_b64}},
                     {"type": "text", "text": (
-                        "Comparar las dos imágenes y evaluar la foto generada.\n\n"
-                        "Verificar punto por punto:\n"
-                        "• ¿Mismos colores exactos? (no saturados ni cambiados)\n"
-                        "• ¿Misma textura/tela?\n"
-                        "• ¿Mismos detalles: botones, cierres, bolsillos, solapas, cuello, "
-                        "capucha, mangas, largo, costuras, cinturón?\n"
-                        "• ¿No agrega elementos inventados?\n"
-                        "• ¿Proporciones y silueta correctas?\n"
-                        "• ¿Calidad profesional e-commerce?\n\n"
+                        "Sos un experto en control de calidad para e-commerce de moda. "
+                        "Comparar MINUCIOSAMENTE la prenda original vs la foto generada.\n\n"
+                        "CHECKLIST OBLIGATORIO — verificar cada punto:\n"
+                        "1. COLOR: ¿Exactamente el mismo tono, saturación y valor? "
+                        "   Penalizar si se ve más brillante, más oscuro o con tinte diferente.\n"
+                        "2. TEXTURA/TELA: ¿Mismo tejido, brillo y peso visual?\n"
+                        "3. BOTONES: ¿Misma cantidad, tamaño, color y posición exacta?\n"
+                        "4. CIERRES/ZIPPERS: ¿Mismo tipo (oculto/expuesto), color, largo y ubicación?\n"
+                        "5. BOLSILLOS: ¿Misma cantidad, forma y tipo (parche/ojal/solapa)?\n"
+                        "6. CUELLO: ¿Mismo tipo exacto (tortuga/solapa/redondo/capucha/etc)?\n"
+                        "7. MANGAS: ¿Mismo largo y puño?\n"
+                        "8. LARGO DE PRENDA: ¿Mismo largo (crop/cadera/rodilla/etc)?\n"
+                        "9. COSTURAS/TOPSTITCHING: ¿Se replican las costuras visibles?\n"
+                        "10. ESTAMPADO/PATRON: ¿Mismo gráfico, raya, cuadro o textura?\n"
+                        "11. ELEMENTOS INVENTADOS: ¿Agrega algún detalle que NO existe en el original?\n"
+                        "12. CALIDAD FOTO: ¿Fondo blanco limpio, iluminación profesional, modelo real?\n\n"
+                        "SCORING:\n"
+                        "- fidelity: promedio de los puntos 1-11 (qué tan idéntica es la prenda)\n"
+                        "- quality: punto 12 (calidad técnica de la foto)\n"
+                        "- score: promedio general\n\n"
                         "Responder SOLO con JSON válido:\n"
                         '{"score": X, "quality": X, "fidelity": X, "ok": true/false, '
-                        '"issues": ["problema concreto 1", "problema concreto 2"], '
-                        '"feedback": "instrucción específica para corregir en el próximo prompt"}\n\n'
+                        '"issues": ["descripción MUY específica del problema 1", '
+                        '"descripción MUY específica del problema 2"], '
+                        '"feedback": "instrucción de 1 línea para corregir en el próximo prompt"}\n\n'
                         f"ok=true SOLO si score>={min_score} Y fidelity>={min_score}. "
-                        "Issues deben ser MUY específicos (ej: 'solapa izquierda más larga que el original', "
-                        "'agregó bolsillo inexistente en pecho')."
+                        "Issues: máximo 4, MUY específicos "
+                        "(ej: 'botón superior falta', 'color viró a beige en vez de blanco roto', "
+                        "'bolsillo derecho del pecho inventado no existe en original'). "
+                        "Si la prenda está bien replicada pero la foto tiene un problema técnico menor, "
+                        "igual indicarlo en issues."
                     )},
                 ],
             }],
@@ -592,7 +631,7 @@ def enhance_garment_with_fallback(garment_bytes):
     return None, None
 
 
-def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
+def gemini_tryon(garment_bytes, n=3, feedback_notes=None, brand="Prany"):
     """
     Gemini 2.0 Flash: genera n fotos de un modelo vistiendo la prenda.
     Corre n llamadas en paralelo. Si hay feedback_notes, ajusta el prompt.
@@ -613,15 +652,25 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
         if feedback_notes:
             feedback_str = (
                 " CRITICAL — fix these issues from the previous attempt: "
-                + "; ".join(feedback_notes[:3]) + "."
+                + "; ".join(feedback_notes[:4]) + "."
             )
+
+        brand_style = (
+            "Model: young, relaxed, trendy look. Pose: casual asymmetric. Aesthetic: ASOS/Urban Outfitters."
+            if brand.lower() in ("vainafash", "vaina")
+            else
+            "Model: tall, elegant, brunette, 20-28yo. Pose: straight, confident. Aesthetic: Zara editorial."
+        )
 
         prompt = (
             "Generate a professional fashion e-commerce photo of a model wearing this EXACT garment. "
-            "Requirements: natural standing pose, clean white studio background, professional studio lighting, "
-            "exact same garment colors patterns and design, full body or 3/4 shot, "
-            "realistic human proportions, no body distortions, no face artifacts, "
-            "photorealistic high quality result."
+            "CRITICAL GARMENT FIDELITY: replicate every detail with zero deviation — "
+            "exact same colors (no brightening/darkening), same texture, same buttons (quantity/position), "
+            "same zippers, same pockets, same collar type, same sleeve length, same hem length, "
+            "same seams and stitching, same print or pattern. Do NOT invent any element. "
+            "Photo requirements: pure white seamless background, professional soft studio lighting, "
+            "full body or 3/4 shot, realistic human proportions, no body distortions, photorealistic. "
+            f"{brand_style}"
             + feedback_str
         )
 
@@ -682,7 +731,7 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None):
         return []
 
 
-def generate_gpt_until_approved(garment_bytes, correction="", n=3, max_attempts=3, min_score=8):
+def generate_gpt_until_approved(garment_bytes, correction="", n=3, max_attempts=4, min_score=9, brand="Prany"):
     """
     GPT-4o: genera fotos hasta que Claude apruebe calidad + fidelidad >= min_score.
     Incorpora feedback de Claude y correcciones del usuario en cada reintento.
@@ -691,9 +740,12 @@ def generate_gpt_until_approved(garment_bytes, correction="", n=3, max_attempts=
     feedback_history = []
     best = {"score": 0, "bytes_list": []}
 
+    # Prompt base según marca
+    base_prompt = GPT_PROMPT_VAINA if brand.lower() in ("vainafash", "vaina") else GPT_PROMPT_PRANY
+
     for attempt in range(1, max_attempts + 1):
-        # Construir prompt: base + corrección del usuario + feedback acumulado de Claude
-        prompt = GPT_BASE_PROMPT
+        # Construir prompt: base de marca + corrección del usuario + feedback acumulado de Claude
+        prompt = base_prompt
         if correction:
             prompt += f"\n\nINSTRUCCIÓN DEL USUARIO: {correction}"
         if feedback_history:
@@ -750,7 +802,7 @@ def generate_gpt_until_approved(garment_bytes, correction="", n=3, max_attempts=
     return []
 
 
-def generate_gemini_until_approved(garment_bytes, correction="", n=3, max_attempts=3, min_score=8):
+def generate_gemini_until_approved(garment_bytes, correction="", n=3, max_attempts=4, min_score=9, brand="Prany"):
     """
     Gemini: fallback si GPT falla. Mismo sistema de evaluación de fidelidad.
     Devuelve bytes aprobados, o el mejor disponible si agota intentos.
@@ -765,7 +817,7 @@ def generate_gemini_until_approved(garment_bytes, correction="", n=3, max_attemp
         notes.extend(feedback_history[-3:])
 
         tg_send(f"🔮 Gemini — intento {attempt}/{max_attempts} ({n} fotos en paralelo)...")
-        bytes_list = gemini_tryon(garment_bytes, n=n, feedback_notes=notes if notes else None)
+        bytes_list = gemini_tryon(garment_bytes, n=n, feedback_notes=notes if notes else None, brand=brand)
 
         if not bytes_list:
             tg_send(f"⚠️ Intento {attempt}: Gemini no generó imágenes, reintentando...")
@@ -1031,7 +1083,7 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
 
     # ── Paso 1: GPT-4o (principal) ────────────────────────────────────────
     photos_bytes = generate_gpt_until_approved(
-        garment_bytes, correction=correction, n=3, max_attempts=3, min_score=8
+        garment_bytes, correction=correction, n=3, max_attempts=4, min_score=9, brand=brand
     )
     if photos_bytes:
         modelo_ia = "gpt4o"
@@ -1039,7 +1091,7 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
     # ── Paso 2: Gemini (fallback si GPT falla) ────────────────────────────
     if not photos_bytes:
         photos_bytes = generate_gemini_until_approved(
-            garment_bytes, correction=correction, n=3, max_attempts=3, min_score=8
+            garment_bytes, correction=correction, n=3, max_attempts=4, min_score=9, brand=brand
         )
         if photos_bytes:
             modelo_ia = "gemini_tryon"
