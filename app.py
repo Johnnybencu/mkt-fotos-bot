@@ -314,12 +314,23 @@ def gpt_generate_photo(garment_bytes, prompt, n=1):
                         ],
                     }],
                     tools=[{"type": "image_generation"}],
+                    tool_choice="required",
                 )
                 for item in resp.output:
-                    if getattr(item, "type", "") == "image_generation_call":
+                    item_type = getattr(item, "type", "")
+                    if item_type == "image_generation_call":
                         result = getattr(item, "result", None)
                         if result:
                             return base64.b64decode(result)
+                    elif item_type == "message":
+                        # GPT respondió con texto en lugar de imagen
+                        content = getattr(item, "content", [])
+                        for c in (content or []):
+                            text_val = getattr(c, "text", "")
+                            if text_val:
+                                print(f"  [GPT] Respuesta texto (no imagen): {text_val[:120]}")
+                    else:
+                        print(f"  [GPT] Output item tipo: {item_type}")
                 print("  [GPT] Sin imagen en respuesta output")
                 return None
             except Exception as e:
