@@ -114,7 +114,7 @@ OK_WORDS = {"ok", "listo", "dale", "perfecto", "bueno", "si", "sí", "confirmed"
 
 # ── Estado global (bot solo responde a 1 usuario) ─────────────────────────────
 SESSION = {
-    "phase":         "idle",  # idle | waiting_instruction | generating | previewing | waiting_name | saving
+    "phase":         "idle",  # idle | waiting_instruction | generating | previewing | waiting_save | waiting_name | saving
     "brands":        [],
     "garment_bytes": None,
     "garment_url":   None,
@@ -1268,78 +1268,109 @@ def run_generation(brands, garment_bytes, category, correction="", flat_lay=Fals
 
 
 def save_to_drive(product_name):
-    """Crea carpetas en Drive y sube todo. Solo se llama tras confirmación."""
+    """Crea carpetas en Drive y sube las fotos. Solo se llama tras confirmación."""
     set_phase("saving")
 
-    date_str  = datetime.now().strftime("%Y%m%d")
-    safe_name = product_name[:40].replace(" ", "_").replace("/", "-")
+    date_str    = datetime.now().strftime("%Y%m%d")
+    safe_name   = product_name[:40].replace(" ", "_").replace("/", "-")
     folder_name = f"{date_str}_{safe_name}"
 
-    drive_token = get_drive_token()
     tg_send(f"💾 Guardando <b>{product_name}</b> en Drive...")
 
     with SESSION_LOCK:
         results = dict(SESSION["results"])
         brands  = list(SESSION["brands"])
 
+    try:
+        drive_token = get_drive_token()
+    except Exception as e:
+        tg_send(f"❌ Error conectando con Drive: {str(e)[:150]}\nVerificá las credenciales en Railway.")
+        set_phase("previewing")
+        return
+
+    guardado_ok = False
+
     for brand in brands:
         result = results.get(brand)
         if not result:
+            tg_send(f"⚠️ Sin fotos para {brand} — saltando.")
             continue
 
+        # Carpeta raíz según marca
         parent_folder = DRIVE_FOLDER_PRANY if brand == "Prany" else DRIVE_FOLDER_VAINA
+        if not parent_folder:
+            tg_send(
+                f"⚠️ <b>{brand}</b>: no está configurada la carpeta de Drive.\n"
+                f"Añadí <code>DRIVE_FOLDER_{'PRANY' if brand == 'Prany' else 'VAINA'}</code> en Railway."
+            )
+            continue
+
+        photos_bytes = result.get("photos_bytes", [])
+        video_url    = result.get("video", "")
+
+        if not photos_bytes:
+            tg_send(f"⚠️ <b>{brand}</b>: sin fotos para guardar.")
+            continue
 
         try:
+            # Crear subcarpeta con fecha + nombre
             subfolder_id = drive_create_folder(folder_name, parent_folder, drive_token)
+            print(f"[DRIVE] {brand}: carpeta creada {folder_name} ({subfolder_id})")
 
-            # Fotos desde bytes (Gemini) — subida directa sin descarga
-            photos_bytes = result.get("photos_bytes", [])
+            # Subir fotos
             for i, img_bytes in enumerate(photos_bytes):
                 drive_upload(f"foto_{i+1}.jpg", img_bytes, "image/jpeg", subfolder_id, drive_token)
+                print(f"[DRIVE] {brand}: foto_{i+1}.jpg subida")
 
-            # Fotos desde URL (legacy) — descargar y subir
-            for j, img_url in enumerate(result.get("photos", [])):
-                img_bytes = requests.get(img_url, timeout=30).content
-                drive_upload(f"foto_{len(photos_bytes)+j+1}.jpg", img_bytes, "image/jpeg", subfolder_id, drive_token)
-
-            if result["video"]:
-                vid_bytes = requests.get(result["video"], timeout=60).content
-                drive_upload("video_1.mp4", vid_bytes, "video/mp4", subfolder_id, drive_token)
+            # Subir video si hay
+            if video_url:
+                try:
+                    vid_bytes = requests.get(video_url, timeout=60).content
+                    drive_upload("video_1.mp4", vid_bytes, "video/mp4", subfolder_id, drive_token)
+                    print(f"[DRIVE] {brand}: video subido")
+                except Exception as ve:
+                    print(f"[DRIVE] {brand}: error subiendo video: {ve}")
 
             drive_link = f"https://drive.google.com/drive/folders/{subfolder_id}"
             tg_send(
-                f"✅ <b>{brand}</b> guardado\n"
+                f"✅ <b>{brand}</b> — {len(photos_bytes)} foto(s) guardada(s)\n"
                 f"📁 <a href='{drive_link}'>{folder_name}</a>"
             )
+            guardado_ok = True
 
-            # Feedback loop: loguear sesión para cruzar con GA4 después
+            # Log para feedback loop
             with SESSION_LOCK:
-                _cap      = SESSION.get("caption", "")
-                _corr     = SESSION.get("correction", "")
-                _fl       = SESSION.get("flat_lay", False)
-                _cat      = SESSION.get("category", "tops")
-                _modelo   = result.get("modelo_ia", "kling_v15")
+                _cap    = SESSION.get("caption", "")
+                _corr   = SESSION.get("correction", "")
+                _fl     = SESSION.get("flat_lay", False)
+                _cat    = SESSION.get("category", "tops")
+                _modelo = result.get("modelo_ia", "gpt4o")
             log_photo_session(brand, product_name, _cat, _fl, _cap, _corr, drive_link, _modelo)
 
         except Exception as e:
-            print(f"[DRIVE] Error {brand}: {e}")
-            tg_send(f"❌ Error guardando <b>{brand}</b>: {str(e)[:150]}")
+            import traceback
+            print(f"[DRIVE] Error {brand}: {traceback.format_exc()}")
+            tg_send(f"❌ Error guardando <b>{brand}</b>: {str(e)[:200]}")
 
-    # Mantener prenda + marca en sesión para permitir correcciones sin re-subir
+    # Mensaje final
     with SESSION_LOCK:
         _brands = list(SESSION["brands"])
-    tg_send(
-        f"🎉 ¡Todo guardado!\n\n"
-        f"Podés seguir enviando correcciones sobre la misma prenda "
-        f"(<b>{', '.join(_brands)}</b>) sin mandar la foto de nuevo.\n"
-        f"O mandá una foto nueva para empezar con otra prenda."
-    )
+
+    if guardado_ok:
+        tg_send(
+            f"🎉 ¡Listo!\n\n"
+            f"Podés seguir corrigiendo la misma prenda sin remandar la foto.\n"
+            f"O mandá una foto nueva para otra prenda."
+        )
+    else:
+        tg_send("⚠️ No se pudo guardar ninguna foto. Revisá la configuración de Drive en Railway.")
+
     with SESSION_LOCK:
         SESSION["phase"]       = "idle"
         SESSION["garment_url"] = None
         SESSION["correction"]  = ""
         SESSION["results"]     = {}
-        # garment_bytes, brands, category, flat_lay, want_video se MANTIENEN
+        # garment_bytes, brands, category se MANTIENEN para correcciones futuras
 
 
 # ── Handlers de mensajes ───────────────────────────────────────────────────────
@@ -1496,9 +1527,17 @@ def handle_text(message):
     # ── Fase: previewing — espera OK o corrección ──────────────────────────────
     if phase == "previewing":
         if words & OK_WORDS:
-            # Usuario confirmó → pedir nombre
-            set_phase("waiting_name")
-            tg_send("✏️ ¿Cómo se llama el producto? (ese nombre se va a usar para la carpeta en Drive)")
+            # Usuario aprobó fotos → preguntar si quiere guardar en Drive
+            with SESSION_LOCK:
+                brands = list(SESSION["brands"])
+            set_phase("waiting_save")
+            carpetas = " y ".join([f"<b>{b}</b>" for b in brands])
+            tg_send(
+                f"💾 ¿Guardamos las fotos en Drive?\n"
+                f"Se van a crear carpetas para {carpetas}.\n\n"
+                f"• <b>si</b> → te pido el nombre del producto\n"
+                f"• <b>no</b> → descartamos y podés seguir corrigiendo"
+            )
             return
         else:
             # Corrección manual: se agrega al prompt y regenera
@@ -1519,6 +1558,19 @@ def handle_text(message):
                 args=(brands, garment_bytes, category, text, flat_lay, want_video),
                 daemon=True,
             ).start()
+        return
+
+    # ── Fase: waiting_save — espera confirmación de guardado ──────────────────
+    if phase == "waiting_save":
+        if words & OK_WORDS or text.lower() in ("si", "sí", "yes", "guardar", "dale"):
+            set_phase("waiting_name")
+            tg_send("✏️ ¿Cómo se llama el producto?\n<i>Ese nombre se usa para la carpeta en Drive.</i>")
+        else:
+            set_phase("previewing")
+            tg_send(
+                "OK, no guardamos. Las fotos siguen disponibles.\n"
+                "Escribí correcciones o <b>ok</b> cuando quieras guardar."
+            )
         return
 
     # ── Fase: waiting_name — espera el nombre del producto ────────────────────
