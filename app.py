@@ -114,16 +114,17 @@ OK_WORDS = {"ok", "listo", "dale", "perfecto", "bueno", "si", "sí", "confirmed"
 
 # ── Estado global (bot solo responde a 1 usuario) ─────────────────────────────
 SESSION = {
-    "phase":        "idle",  # idle | generating | previewing | waiting_name | saving
-    "brands":       [],
+    "phase":         "idle",  # idle | generating | previewing | waiting_name | saving
+    "brands":        [],
     "garment_bytes": None,
-    "garment_url":  None,
-    "category":     "tops",
-    "flat_lay":     False,
-    "caption":      "",
-    "correction":   "",
+    "garment_url":   None,
+    "category":      "tops",
+    "flat_lay":      False,
+    "caption":       "",
+    "correction":    "",
+    "want_video":    False,   # True solo si el caption incluye "video"
     "results": {
-        # "Prany":     {"photos": [...], "video": "...", "model_url": "..."},
+        # "Prany":     {"photos_bytes": [...], "video": "...", "modelo_ia": "..."},
         # "Vainafash": {...},
     },
 }
@@ -1117,7 +1118,7 @@ def kling_video(image_url, prompt):
 
 
 # ── Pipeline de generación ─────────────────────────────────────────────────────
-def generate_for_brand(brand, garment_bytes, garment_url, category, correction="", flat_lay=False):
+def generate_for_brand(brand, garment_bytes, garment_url, category, correction="", flat_lay=False, want_video=False):
     """
     Genera fotos y video para una marca.
     Si hay corrección del usuario, se incorpora al prompt del video.
@@ -1175,30 +1176,31 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
         )
         return {"photos_bytes": [], "photos": [], "video": "", "modelo_ia": "failed"}
 
-    # ── Video: Claude elige la mejor foto para animar, luego Kling ────────
+    # ── Video: solo si want_video=True ────────────────────────────────────
     video = ""
-    try:
-        tg_send(f"🎬 <b>{brand}</b>: generando video...")
+    if want_video:
+        try:
+            tg_send(f"🎬 <b>{brand}</b>: generando video...")
 
-        # Claude elige la foto más apta para animar (figura completa, pose natural)
-        best_photo_bytes = _pick_best_for_video(photos_bytes, garment_bytes)
-        best_url = fal_upload(best_photo_bytes)
+            # Claude elige la foto más apta para animar (figura completa, pose natural)
+            best_photo_bytes = _pick_best_for_video(photos_bytes, garment_bytes)
+            best_url = fal_upload(best_photo_bytes)
 
-        # Hasta 2 intentos de video
-        for vid_attempt in range(1, 3):
-            try:
-                video = kling_video(best_url, video_prompt)
-                if video:
-                    print(f"  [VIDEO] ✓ {brand} — intento {vid_attempt}")
-                    break
-                print(f"  [VIDEO] Intento {vid_attempt} sin resultado, reintentando...")
-            except Exception as ve:
-                print(f"  [VIDEO] Error intento {vid_attempt}: {ve}")
-        if not video:
-            tg_send(f"⚠️ <b>{brand}</b>: no se pudo generar el video (fotos ok ✅)")
-    except Exception as e:
-        print(f"[VIDEO] Error fatal {brand}: {e}")
-        tg_send(f"⚠️ <b>{brand}</b>: error en video — {str(e)[:100]}")
+            # Hasta 2 intentos de video
+            for vid_attempt in range(1, 3):
+                try:
+                    video = kling_video(best_url, video_prompt)
+                    if video:
+                        print(f"  [VIDEO] ✓ {brand} — intento {vid_attempt}")
+                        break
+                    print(f"  [VIDEO] Intento {vid_attempt} sin resultado, reintentando...")
+                except Exception as ve:
+                    print(f"  [VIDEO] Error intento {vid_attempt}: {ve}")
+            if not video:
+                tg_send(f"⚠️ <b>{brand}</b>: no se pudo generar el video (fotos ok ✅)")
+        except Exception as e:
+            print(f"[VIDEO] Error fatal {brand}: {e}")
+            tg_send(f"⚠️ <b>{brand}</b>: error en video — {str(e)[:100]}")
 
     return {
         "photos_bytes": photos_bytes,
@@ -1233,7 +1235,7 @@ def send_previews(brand, result):
         tg_send_video(video, f"{brand} — Video")
 
 
-def run_generation(brands, garment_bytes, category, correction="", flat_lay=False):
+def run_generation(brands, garment_bytes, category, correction="", flat_lay=False, want_video=False):
     """
     Corre el pipeline completo para todas las marcas,
     manda previews y queda en fase 'previewing'.
@@ -1247,7 +1249,7 @@ def run_generation(brands, garment_bytes, category, correction="", flat_lay=Fals
     for brand in brands:
         tg_send(f"🔄 <b>{brand}</b>: generando fotos (puede tardar 2-3 min)... ☕")
         try:
-            result = generate_for_brand(brand, garment_bytes, None, category, correction, flat_lay)
+            result = generate_for_brand(brand, garment_bytes, None, category, correction, flat_lay, want_video)
             with SESSION_LOCK:
                 SESSION["results"][brand] = result
             send_previews(brand, result)
@@ -1323,16 +1325,21 @@ def save_to_drive(product_name):
             print(f"[DRIVE] Error {brand}: {e}")
             tg_send(f"❌ Error guardando <b>{brand}</b>: {str(e)[:150]}")
 
-    tg_send("🎉 ¡Todo guardado! Mandame otra foto cuando quieras.")
+    # Mantener prenda + marca en sesión para permitir correcciones sin re-subir
     with SESSION_LOCK:
-        SESSION["phase"]         = "idle"
-        SESSION["brands"]        = []
-        SESSION["garment_bytes"] = None
-        SESSION["garment_url"]   = None
-        SESSION["flat_lay"]      = False
-        SESSION["caption"]       = ""
-        SESSION["correction"]    = ""
-        SESSION["results"]       = {}
+        _brands = list(SESSION["brands"])
+    tg_send(
+        f"🎉 ¡Todo guardado!\n\n"
+        f"Podés seguir enviando correcciones sobre la misma prenda "
+        f"(<b>{', '.join(_brands)}</b>) sin mandar la foto de nuevo.\n"
+        f"O mandá una foto nueva para empezar con otra prenda."
+    )
+    with SESSION_LOCK:
+        SESSION["phase"]       = "idle"
+        SESSION["garment_url"] = None
+        SESSION["correction"]  = ""
+        SESSION["results"]     = {}
+        # garment_bytes, brands, category, flat_lay, want_video se MANTIENEN
 
 
 # ── Handlers de mensajes ───────────────────────────────────────────────────────
@@ -1373,6 +1380,9 @@ def handle_photo(message):
     # flat_lay solo si el usuario indica explícitamente que la foto es producto en fondo blanco
     flat_lay = any(w in cap_low for w in ["fondo blanco", "flat lay", "flatlay", "producto", "hanger", "percha"])
 
+    # Video solo si el caption incluye "video" explícitamente
+    want_video = "video" in cap_low
+
     # Descargar foto
     photo_list = message.get("photo", [])
     document   = message.get("document", {})
@@ -1406,17 +1416,19 @@ def handle_photo(message):
         SESSION["flat_lay"]      = flat_lay
         SESSION["caption"]       = caption
         SESSION["correction"]    = ""
+        SESSION["want_video"]    = want_video
 
     modo = "fondo blanco ✅" if flat_lay else "foto de campo"
+    video_txt = " + 🎬 video" if want_video else " (sin video — añadí 'video' al caption para generarlo)"
     tg_send(
         f"📸 Foto recibida ({len(photo_bytes) // 1024} KB) | "
-        f"Marca(s): <b>{', '.join(brands)}</b> | Modo: {modo}\n"
+        f"Marca(s): <b>{', '.join(brands)}</b> | Modo: {modo}{video_txt}\n"
         f"⏳ Generando previews..."
     )
 
     threading.Thread(
         target=run_generation,
-        args=(brands, photo_bytes, category, "", flat_lay),
+        args=(brands, photo_bytes, category, "", flat_lay, want_video),
         daemon=True,
     ).start()
 
@@ -1431,18 +1443,21 @@ def handle_text(message):
     if text.startswith("/start") or text.lower() in ("hola", "start"):
         tg_send(
             "👗 <b>MktFotos Bot</b>\n\n"
-            "Mandame una foto de la prenda con el caption de la marca:\n"
-            "• <b>Prany</b> / <b>Vaina</b> / <b>Ambas</b>\n\n"
-            "<b>¿Cómo funciona?</b>\n"
-            "1. GPT-4o genera 3 fotos con modelo\n"
-            "2. Claude compara la prenda original vs generada\n"
-            "   (colores, solapas, bolsillos, costuras, largo...)\n"
-            "3. Si algo no coincide, reintenta automáticamente\n"
+            "<b>Cómo mandar fotos:</b>\n"
+            "• <code>Prany</code> → 3 fotos Prany\n"
+            "• <code>Vaina</code> → 3 fotos Vainafash\n"
+            "• <code>Ambas</code> → 3 fotos de cada marca\n"
+            "• <code>Prany video</code> → fotos + video (costo extra ~$0.28 USD)\n\n"
+            "<b>Pipeline automático:</b>\n"
+            "1. GPT-4o genera 3 fotos con modelo femenina\n"
+            "2. Claude evalúa fidelidad vs prenda original (9/10 mínimo)\n"
+            "3. Si no aprueba → reintenta con correcciones automáticas\n"
             "4. Si GPT falla → Gemini como respaldo\n\n"
-            "Cuando ves las fotos podés escribir correcciones:\n"
-            "<i>\"la solapa quedó mal\"</i> / <i>\"más editorial\"</i> / "
-            "<i>\"la cara no me gusta\"</i>\n"
-            "→ se regenera con tu instrucción incorporada al prompt\n\n"
+            "<b>Correcciones:</b>\n"
+            "Después de ver las fotos escribí lo que querés cambiar:\n"
+            "<i>\"la quiero en negro\"</i> / <i>\"pose más dinámica\"</i> / <i>\"cara diferente\"</i>\n"
+            "→ regenera la misma prenda sin tener que mandarla de nuevo\n"
+            "→ funciona incluso después de guardar en Drive\n\n"
             "Cuando estés conforme → <b>ok / listo / dale</b> 📁"
         )
         return
@@ -1471,15 +1486,16 @@ def handle_text(message):
                 garment_bytes = SESSION["garment_bytes"]
                 category      = SESSION["category"]
                 flat_lay      = SESSION["flat_lay"]
+                want_video    = SESSION.get("want_video", False)
                 SESSION["correction"] = text
 
             tg_send(
-                f"✏️ Corrección recibida: <i>\"{text}\"</i>\n"
-                f"🔄 Regenerando con GPT-4o (tu instrucción se agrega al prompt)..."
+                f"✏️ Corrección: <i>\"{text}\"</i>\n"
+                f"🔄 Regenerando <b>{', '.join(brands)}</b> con la misma prenda..."
             )
             threading.Thread(
                 target=run_generation,
-                args=(brands, garment_bytes, category, text, flat_lay),
+                args=(brands, garment_bytes, category, text, flat_lay, want_video),
                 daemon=True,
             ).start()
         return
@@ -1498,10 +1514,34 @@ def handle_text(message):
     if phase in ("generating", "saving"):
         tg_send("⏳ Estoy trabajando, esperá un momento...")
     else:
-        tg_send(
-            "📸 Mandame una foto de la prenda con el caption de la marca:\n"
-            "<b>Prany</b> / <b>Vaina</b> / <b>Ambas</b>"
-        )
+        # ¿Hay prenda de una sesión anterior guardada?
+        with SESSION_LOCK:
+            garment_bytes = SESSION.get("garment_bytes")
+            brands        = list(SESSION.get("brands", []))
+            category      = SESSION.get("category", "tops")
+            flat_lay      = SESSION.get("flat_lay", False)
+            want_video    = SESSION.get("want_video", False)
+
+        if garment_bytes and brands:
+            # Tratar el texto como corrección sobre la prenda anterior
+            with SESSION_LOCK:
+                SESSION["correction"] = text
+            tg_send(
+                f"✏️ Corrección: <i>\"{text}\"</i>\n"
+                f"🔄 Regenerando <b>{', '.join(brands)}</b> con la misma prenda..."
+            )
+            threading.Thread(
+                target=run_generation,
+                args=(brands, garment_bytes, category, text, flat_lay, want_video),
+                daemon=True,
+            ).start()
+        else:
+            tg_send(
+                "📸 Mandame una foto de la prenda con el caption de la marca:\n"
+                "• <b>Prany</b> / <b>Vaina</b> / <b>Ambas</b>\n\n"
+                "Añadí <b>video</b> al caption si querés generar video también.\n"
+                "<i>Ej: \"Prany video\" o \"Ambas video\"</i>"
+            )
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
