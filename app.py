@@ -79,21 +79,25 @@ GPT_BASE_PROMPT = (
 GPT_PROMPT_PRANY = (
     GPT_BASE_PROMPT + "\n\n"
     "Brand style — PRANY (sophisticated Argentine fashion):\n"
-    "- Model: tall, slender, brunette or dark hair, Southern European look, 20-28 years old\n"
+    "- ALWAYS a FEMALE model — woman, girl, she/her — NEVER a man or male figure\n"
+    "- Model: tall, slender, brunette or dark straight hair, Southern European look, 22-28 years old\n"
     "- Expression: calm, confident, neutral — high-fashion editorial\n"
     "- Pose: straight, elegant, hands relaxed at sides or one hand slightly raised\n"
     "- Aesthetic: clean minimalist editorial — think Zara or Massimo Dutti campaign\n"
-    "- Lighting: bright, even, soft — no dramatic shadows"
+    "- Lighting: bright, even, soft — no dramatic shadows\n"
+    "- Background: pure white seamless studio"
 )
 
 GPT_PROMPT_VAINA = (
     GPT_BASE_PROMPT + "\n\n"
-    "Brand style — VAINAFASH (trendy urban streetwear):\n"
-    "- Model: young, energetic, diverse look, 18-26 years old\n"
-    "- Expression: natural, slightly relaxed, approachable — lifestyle feel\n"
-    "- Pose: relaxed, slightly asymmetric — weight on one leg, casual attitude\n"
-    "- Aesthetic: fresh contemporary e-commerce — think ASOS or Urban Outfitters\n"
-    "- Lighting: bright, clean, modern studio"
+    "Brand style — VAINAFASH (trendy urban fashion):\n"
+    "- ALWAYS a FEMALE model — woman, girl, she/her — NEVER a man or male figure\n"
+    "- Model: young woman, 18-25 years old, light brown or blonde hair, fresh and natural look\n"
+    "- Expression: natural, slightly smiling, approachable and relatable\n"
+    "- Pose: relaxed, slightly asymmetric — weight on one leg, casual confidence\n"
+    "- Aesthetic: fresh contemporary e-commerce — think ASOS or Zara TRF campaign\n"
+    "- Lighting: bright, clean, modern studio\n"
+    "- Background: pure white seamless studio"
 )
 BOT_PUBLIC_URL     = os.environ.get("BOT_PUBLIC_URL", "https://web-production-71a27.up.railway.app")
 TIKTOK_REDIRECT    = f"{BOT_PUBLIC_URL}/tiktok-callback"
@@ -667,10 +671,12 @@ def gemini_tryon(garment_bytes, n=3, feedback_notes=None, brand="Prany"):
             )
 
         brand_style = (
-            "Model: young, relaxed, trendy look. Pose: casual asymmetric. Aesthetic: ASOS/Urban Outfitters."
+            "FEMALE model only (woman, never a man). Model: young woman 18-25yo, light brown or blonde hair, natural look. "
+            "Pose: relaxed asymmetric, casual confidence. Aesthetic: ASOS/Zara TRF."
             if brand.lower() in ("vainafash", "vaina")
             else
-            "Model: tall, elegant, brunette, 20-28yo. Pose: straight, confident. Aesthetic: Zara editorial."
+            "FEMALE model only (woman, never a man). Model: tall elegant brunette woman, 22-28yo, Southern European look. "
+            "Pose: straight, confident. Aesthetic: Zara/Massimo Dutti editorial."
         )
 
         prompt = (
@@ -881,6 +887,57 @@ def generate_gemini_until_approved(garment_bytes, correction="", n=3, max_attemp
     return []
 
 
+def _pick_best_for_video(photos_bytes, garment_bytes):
+    """
+    Claude elige cuál de las fotos generadas es más apta para animar con Kling:
+    prefiere figura completa visible, pose natural, modelo centrada, sin cortes.
+    Si solo hay 1 foto o Claude falla, devuelve la primera.
+    """
+    if len(photos_bytes) == 1 or not ANTHROPIC_API_KEY:
+        return photos_bytes[0]
+    try:
+        import anthropic as _anth
+        import re as _re
+
+        client = _anth.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        content = [{"type": "text", "text": (
+            "Tenés estas fotos de moda generadas por IA. "
+            "Elegí cuál es MÁS APTA para generar un video de animación con IA (Kling). "
+            "Criterios en orden de importancia:\n"
+            "1. Figura femenina COMPLETA visible (cabeza + cuerpo + pies)\n"
+            "2. Pose natural y estable (no demasiado rígida ni demasiado dinámica)\n"
+            "3. Modelo centrada en el encuadre\n"
+            "4. Sin cortes ni partes del cuerpo fuera de frame\n"
+            "5. Fondo blanco limpio\n\n"
+            f"Hay {len(photos_bytes)} fotos numeradas del 0 al {len(photos_bytes)-1}. "
+            "Respondé SOLO con el número (0, 1, 2...) de la foto elegida."
+        )}]
+
+        for i, pb in enumerate(photos_bytes):
+            content.append({"type": "text", "text": f"Foto {i}:"})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.b64encode(pb).decode()
+            }})
+
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=10,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = resp.content[0].text.strip()
+        m = _re.search(r"\d+", text)
+        if m:
+            idx = int(m.group())
+            if 0 <= idx < len(photos_bytes):
+                print(f"  [VIDEO] Claude eligió foto {idx} para animar")
+                return photos_bytes[idx]
+    except Exception as e:
+        print(f"  [VIDEO] Error eligiendo foto: {e}")
+    return photos_bytes[0]
+
+
 def _extract_style_keywords(caption, correction, flat_lay, category):
     """Extrae keywords de estilo para el feedback loop."""
     keywords = []
@@ -1068,12 +1125,14 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
     """
     drive_token = get_drive_token()
 
-    # Modelo de referencia
+    # Modelo de referencia + video prompt por marca
     if brand == "Prany":
-        model_bytes   = drive_download(MODELO_PRANY_DRIVE_ID, drive_token)
-        video_prompt  = (
-            "Fashion model walking elegantly, wearing the outfit, "
-            "smooth movement, soft studio lighting, clean background, fashion editorial"
+        model_bytes  = drive_download(MODELO_PRANY_DRIVE_ID, drive_token)
+        video_prompt = (
+            "Elegant female fashion model walking slowly and gracefully, "
+            "wearing the outfit, smooth fluid movement, soft studio lighting, "
+            "pure white background, high-end fashion editorial style, "
+            "full body visible, photorealistic, cinematic quality"
         )
     else:  # Vainafash
         model_file_id = drive_first_image_in_folder(MODELO_VAINA_DRIVE_FOLDER, drive_token) if MODELO_VAINA_DRIVE_FOLDER else None
@@ -1082,8 +1141,10 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
         else:
             model_bytes = garment_bytes
         video_prompt = (
-            "POV walking video, looking down at trendy outfit, "
-            "urban street style, natural lighting, aesthetic movement"
+            "Young female fashion model walking confidently, "
+            "wearing the outfit, natural relaxed movement, bright studio lighting, "
+            "pure white background, fresh contemporary e-commerce style, "
+            "full body visible, photorealistic, cinematic quality"
         )
 
     if correction:
@@ -1114,13 +1175,30 @@ def generate_for_brand(brand, garment_bytes, garment_url, category, correction="
         )
         return {"photos_bytes": [], "photos": [], "video": "", "modelo_ia": "failed"}
 
-    # ── Video: subir mejor foto a fal.ai solo para Kling video ───────────
+    # ── Video: Claude elige la mejor foto para animar, luego Kling ────────
     video = ""
     try:
-        best_url = fal_upload(photos_bytes[0])
-        video = kling_video(best_url, video_prompt)
+        tg_send(f"🎬 <b>{brand}</b>: generando video...")
+
+        # Claude elige la foto más apta para animar (figura completa, pose natural)
+        best_photo_bytes = _pick_best_for_video(photos_bytes, garment_bytes)
+        best_url = fal_upload(best_photo_bytes)
+
+        # Hasta 2 intentos de video
+        for vid_attempt in range(1, 3):
+            try:
+                video = kling_video(best_url, video_prompt)
+                if video:
+                    print(f"  [VIDEO] ✓ {brand} — intento {vid_attempt}")
+                    break
+                print(f"  [VIDEO] Intento {vid_attempt} sin resultado, reintentando...")
+            except Exception as ve:
+                print(f"  [VIDEO] Error intento {vid_attempt}: {ve}")
+        if not video:
+            tg_send(f"⚠️ <b>{brand}</b>: no se pudo generar el video (fotos ok ✅)")
     except Exception as e:
-        print(f"[VIDEO] Error: {e}")
+        print(f"[VIDEO] Error fatal {brand}: {e}")
+        tg_send(f"⚠️ <b>{brand}</b>: error en video — {str(e)[:100]}")
 
     return {
         "photos_bytes": photos_bytes,
