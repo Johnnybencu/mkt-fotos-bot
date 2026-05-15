@@ -114,7 +114,7 @@ OK_WORDS = {"ok", "listo", "dale", "perfecto", "bueno", "si", "sí", "confirmed"
 
 # ── Estado global (bot solo responde a 1 usuario) ─────────────────────────────
 SESSION = {
-    "phase":         "idle",  # idle | generating | previewing | waiting_name | saving
+    "phase":         "idle",  # idle | waiting_instruction | generating | previewing | waiting_name | saving
     "brands":        [],
     "garment_bytes": None,
     "garment_url":   None,
@@ -1419,18 +1419,16 @@ def handle_photo(message):
         SESSION["want_video"]    = want_video
 
     modo = "fondo blanco ✅" if flat_lay else "foto de campo"
-    video_txt = " + 🎬 video" if want_video else " (sin video — añadí 'video' al caption para generarlo)"
+    video_txt = " + 🎬 video" if want_video else ""
     tg_send(
-        f"📸 Foto recibida ({len(photo_bytes) // 1024} KB) | "
-        f"Marca(s): <b>{', '.join(brands)}</b> | Modo: {modo}{video_txt}\n"
-        f"⏳ Generando previews..."
+        f"📸 Foto recibida ({len(photo_bytes) // 1024} KB)\n"
+        f"Marca(s): <b>{', '.join(brands)}</b> | {modo}{video_txt}\n\n"
+        f"¿Tenés alguna instrucción para las fotos?\n"
+        f"<i>Ej: \"que sea en negro\", \"pose dinámica\", \"fondo gris\", \"sin capucha\"</i>\n"
+        f"O escribí <b>no</b> para generar ya."
     )
-
-    threading.Thread(
-        target=run_generation,
-        args=(brands, photo_bytes, category, "", flat_lay, want_video),
-        daemon=True,
-    ).start()
+    with SESSION_LOCK:
+        SESSION["phase"] = "waiting_instruction"
 
 
 def handle_text(message):
@@ -1443,22 +1441,18 @@ def handle_text(message):
     if text.startswith("/start") or text.lower() in ("hola", "start"):
         tg_send(
             "👗 <b>MktFotos Bot</b>\n\n"
-            "<b>Cómo mandar fotos:</b>\n"
-            "• <code>Prany</code> → 3 fotos Prany\n"
-            "• <code>Vaina</code> → 3 fotos Vainafash\n"
-            "• <code>Ambas</code> → 3 fotos de cada marca\n"
-            "• <code>Prany video</code> → fotos + video (costo extra ~$0.28 USD)\n\n"
-            "<b>Pipeline automático:</b>\n"
-            "1. GPT-4o genera 3 fotos con modelo femenina\n"
-            "2. Claude evalúa fidelidad vs prenda original (9/10 mínimo)\n"
-            "3. Si no aprueba → reintenta con correcciones automáticas\n"
-            "4. Si GPT falla → Gemini como respaldo\n\n"
-            "<b>Correcciones:</b>\n"
-            "Después de ver las fotos escribí lo que querés cambiar:\n"
-            "<i>\"la quiero en negro\"</i> / <i>\"pose más dinámica\"</i> / <i>\"cara diferente\"</i>\n"
-            "→ regenera la misma prenda sin tener que mandarla de nuevo\n"
-            "→ funciona incluso después de guardar en Drive\n\n"
-            "Cuando estés conforme → <b>ok / listo / dale</b> 📁"
+            "<b>Flujo:</b>\n"
+            "1️⃣ Mandá foto + caption con la marca:\n"
+            "   • <code>Prany</code> / <code>Vaina</code> / <code>Ambas</code>\n"
+            "   • Agregá <code>video</code> si querés video (~$0.28 USD extra)\n\n"
+            "2️⃣ El bot te pregunta si tenés alguna instrucción:\n"
+            "   <i>\"en negro\", \"pose dinámica\", \"fondo gris\"</i>\n"
+            "   O escribí <b>no</b> para generar directo\n\n"
+            "3️⃣ Se generan 3 fotos — Claude evalúa fidelidad (9/10 mínimo)\n\n"
+            "4️⃣ Revisás las fotos y podés:\n"
+            "   • Escribir correcciones → regenera la misma prenda\n"
+            "   • Decir <b>ok / listo</b> → te pide el nombre y guarda en Drive\n\n"
+            "💡 Después de guardar podés seguir corrigiendo la misma prenda sin remandar la foto."
         )
         return
 
@@ -1470,6 +1464,33 @@ def handle_text(message):
             SESSION["garment_bytes"] = None
             SESSION["results"]      = {}
         tg_send("🗑️ Sesión cancelada. Mandame una nueva foto cuando quieras.")
+        return
+
+    # ── Fase: waiting_instruction — espera instrucción antes de generar ──────────
+    if phase == "waiting_instruction":
+        with SESSION_LOCK:
+            brands        = list(SESSION["brands"])
+            garment_bytes = SESSION["garment_bytes"]
+            category      = SESSION["category"]
+            flat_lay      = SESSION["flat_lay"]
+            want_video    = SESSION.get("want_video", False)
+            # Si dice "no", generamos sin instrucción
+            instruction = "" if text.lower() in ("no", "nop", "nope", "ninguna", "sin comentarios", "dale") else text
+            SESSION["correction"] = instruction
+
+        if instruction:
+            tg_send(
+                f"✅ Instrucción guardada: <i>\"{instruction}\"</i>\n"
+                f"🔄 Generando con esa indicación desde el primer intento..."
+            )
+        else:
+            tg_send("🔄 Generando sin instrucción adicional...")
+
+        threading.Thread(
+            target=run_generation,
+            args=(brands, garment_bytes, category, instruction, flat_lay, want_video),
+            daemon=True,
+        ).start()
         return
 
     # ── Fase: previewing — espera OK o corrección ──────────────────────────────
